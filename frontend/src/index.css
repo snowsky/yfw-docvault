@@ -1,0 +1,193 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 20% 98%;
+  --foreground: 220 13% 18%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 13% 18%;
+  --primary: 221 83% 53%;
+  --primary-foreground: 210 20% 98%;
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 20% 98%;
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 221 83% 53%;
+  --radius: 0.5rem;
+  color: hsl(var(--foreground));
+  background: hsl(var(--background));
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: hsl(var(--background));
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.dv-card {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.dv-card-header {
+  padding: 16px 16px 0;
+}
+
+.dv-card-content {
+  padding: 16px;
+}
+
+.dv-card-title {
+  font-weight: 650;
+}
+
+.dv-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid #0f172a;
+  border-radius: 6px;
+  background: #0f172a;
+  color: white;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.dv-button-outline {
+  border-color: #d1d5db;
+  background: white;
+  color: #111827;
+}
+
+.dv-button-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: #374151;
+}
+
+.dv-button-sm {
+  min-height: 32px;
+  padding: 5px 9px;
+  font-size: 13px;
+}
+
+.dv-button-icon {
+  width: 34px;
+  min-height: 34px;
+  padding: 0;
+}
+
+.dv-input,
+.dv-textarea,
+.dv-select {
+  width: 100%;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: white;
+  color: #111827;
+  padding: 8px 10px;
+}
+
+.dv-textarea {
+  min-height: 90px;
+  resize: vertical;
+}
+
+.dv-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+}
+
+.dv-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dv-badge-danger {
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
+.dv-badge-outline {
+  background: white;
+}
+
+.dv-tabs-list {
+  display: grid;
+  gap: 6px;
+}
+
+.dv-tab-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: white;
+  color: #374151;
+  cursor: pointer;
+}
+
+.dv-tab-active {
+  border-color: #0f172a;
+  background: #0f172a;
+  color: white;
+}
+
+.dv-select-shell {
+  display: none;
+}
+
+.dv-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 23, 42, 0.55);
+  padding: 20px;
+}
+
+.dv-dialog-content {
+  width: min(680px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  border-radius: 8px;
+  background: white;
+  padding: 20px;
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.25);
+}
+
+.dv-dialog-title {
+  font-size: 18px;
+  font-weight: 700;
+}

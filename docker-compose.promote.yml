@@ -1,0 +1,21 @@
+# Promotion helper for DocVault.
+#
+# Usage (run from this yfw-docvault directory when it is a sibling of
+# invoice_app/):
+#   docker compose -f docker-compose.promote.yml run --rm promote
+#
+# This copies the standalone plugin files into invoice_app's promoted plugin
+# folders. Backend files stay ignored by default; add PROMOTE_ARGS=--force
+# --track-backend if you intentionally want to commit a promoted backend copy.
+
+services:
+  promote:
+    image: python:3.12-slim
+    working_dir: /workspace/invoice_app
+    environment:
+      PROMOTE_ARGS: ${PROMOTE_ARGS:---force}
+    volumes:
+      - ../invoice_app:/workspace/invoice_app
+      - .:/workspace/yfw-docvault:ro
+    command: >
+      sh -c "python -B api/scripts/promote_plugin.py /workspace/yfw-docvault $$PROMOTE_ARGS"

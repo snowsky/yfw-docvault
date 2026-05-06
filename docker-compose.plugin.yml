@@ -1,0 +1,19 @@
+# Dynamic plugin mode - attach DocVault to a running YFW main app.
+#
+# Usage (run from the invoice_app/ directory):
+#   docker compose -f docker-compose.yml \
+#                  -f yfw-docvault/docker-compose.plugin.yml up
+#
+# This is different from SocialHub's sidecar mode. DocVault is an in-process
+# plugin that uses the main app's tenant database and encrypted column helpers.
+# The override mounts this standalone package into the app's dynamic plugin
+# directories so the backend loader and Vite UI loader discover it at runtime.
+
+services:
+  api:
+    volumes:
+      - ./yfw-docvault:/app/plugins_dynamic/docvault:ro
+
+  ui:
+    volumes:
+      - ./yfw-docvault:/app/src/plugins_dynamic/docvault:ro
