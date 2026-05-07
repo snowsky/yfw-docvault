@@ -6,6 +6,7 @@ import re
 import hashlib
 from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -31,6 +32,7 @@ from .schemas import (
     DocVaultAttachmentVersionResponse,
     DocVaultAuditPackageRequest,
     DocVaultAuditPackageResponse,
+    DocVaultCloudLinkRequest,
     DocVaultEntryCreate,
     DocVaultEntryResponse,
     DocVaultEntryUpdate,
@@ -76,6 +78,27 @@ def _mask_entry_payload(category: str, payload: dict[str, Any] | None) -> dict[s
 
 def _checksum(data: str | None) -> str:
     return hashlib.sha256((data or "").encode("utf-8")).hexdigest()
+
+
+def _provider_label(provider: str) -> str:
+    return {"google_drive": "Google Drive", "onedrive": "OneDrive"}.get(provider, provider)
+
+
+def _normalize_cloud_link(payload: DocVaultCloudLinkRequest) -> dict[str, Any]:
+    url = payload.file_url.strip()
+    hostname = (urlparse(url).hostname or "").lower()
+    if payload.provider == "google_drive" and hostname not in {"drive.google.com", "docs.google.com"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google Drive links must use drive.google.com or docs.google.com")
+    if payload.provider == "onedrive" and hostname not in {"onedrive.live.com", "1drv.ms"} and not hostname.endswith(".sharepoint.com"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OneDrive links must use onedrive.live.com, 1drv.ms, or sharepoint.com")
+    return {
+        "provider": payload.provider,
+        "provider_label": _provider_label(payload.provider),
+        "file_url": url,
+        "file_id": payload.file_id,
+        "file_name": payload.file_name,
+        "linked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _version_response(version: DocVaultAttachmentVersion) -> DocVaultAttachmentVersionResponse:
@@ -261,7 +284,24 @@ async def create_entry(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
-    entry = DocVaultEntry(**payload.model_dump(), created_by=current_user.id)
+    values = payload.model_dump()
+    metadata = dict(values.get("public_metadata") or {})
+    cloud_integration = metadata.get("cloud_integration")
+    if values.get("category") == "document" and cloud_integration:
+        if cloud_integration.get("provider") not in {"google_drive", "onedrive"} or not cloud_integration.get("file_url"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cloud document links require google_drive or onedrive and file_url")
+        cloud_payload = DocVaultCloudLinkRequest(
+            provider=cloud_integration.get("provider"),
+            file_url=cloud_integration.get("file_url"),
+            file_id=cloud_integration.get("file_id"),
+            file_name=cloud_integration.get("file_name") or values.get("file_name"),
+            file_mime_type=values.get("file_mime_type"),
+        )
+        metadata["cloud_integration"] = _normalize_cloud_link(cloud_payload)
+        values["public_metadata"] = metadata
+        values["file_name"] = values.get("file_name") or cloud_payload.file_name or _provider_label(cloud_payload.provider)
+        values["file_data_url"] = None
+    entry = DocVaultEntry(**values, created_by=current_user.id)
     db.add(entry)
     db.commit()
     db.refresh(entry)
@@ -273,7 +313,7 @@ async def create_entry(
             file_mime_type=entry.file_mime_type,
             file_size=entry.file_size,
             file_data_url=entry.file_data_url,
-            change_note="Initial upload",
+            change_note="Initial cloud link" if cloud_integration else "Initial upload",
             user_id=current_user.id,
         )
         db.commit()
@@ -427,6 +467,47 @@ async def create_attachment_version(
         details={"version": version.version, "checksum_sha256": version.checksum_sha256},
     )
     return _version_response(version)
+
+
+@router.post("/{entry_id}/cloud-link", response_model=DocVaultEntryResponse)
+async def link_cloud_document(
+    entry_id: int,
+    payload: DocVaultCloudLinkRequest,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    entry = _get_entry_or_404(db, entry_id)
+    metadata = dict(entry.public_metadata or {})
+    metadata["cloud_integration"] = _normalize_cloud_link(payload)
+    entry.category = "document"
+    entry.public_metadata = metadata
+    entry.file_name = payload.file_name or entry.file_name or _provider_label(payload.provider)
+    entry.file_mime_type = payload.file_mime_type or entry.file_mime_type
+    entry.file_data_url = None
+    _create_attachment_version(
+        db,
+        entry,
+        file_name=entry.file_name,
+        file_mime_type=entry.file_mime_type,
+        file_size=entry.file_size,
+        file_data_url=None,
+        change_note=payload.change_note or f"Linked {_provider_label(payload.provider)} file",
+        user_id=current_user.id,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_CLOUD_LINK",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"provider": payload.provider, "file_name": entry.file_name},
+    )
+    return _serialize_with_counts(db, entry)
 
 
 @router.get("/{entry_id}/signatures", response_model=list[DocVaultSignatureResponse])

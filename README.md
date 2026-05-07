@@ -9,6 +9,7 @@ DocVault is a document and expiry manager for YourFinanceWORKS. It can run as a 
 - AI-assisted card scan confirmation flow
 - MFA-gated access to sensitive details in plugin mode
 - Version-controlled document attachments with checksum history
+- Google Drive and OneDrive document links with provider-aware validation
 - Digital signature records for document approvals
 - Retention policy automation with archive runs
 - Audit-ready package generation for external auditors
@@ -126,6 +127,7 @@ POST   /api/v1/docvault/scan-card
 
 GET    /api/v1/docvault/{entry_id}/attachments
 POST   /api/v1/docvault/{entry_id}/attachments
+POST   /api/v1/docvault/{entry_id}/cloud-link
 GET    /api/v1/docvault/{entry_id}/signatures
 POST   /api/v1/docvault/{entry_id}/signatures
 POST   /api/v1/docvault/retention/run

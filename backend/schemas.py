@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 DocVaultCategory = Literal["credit_card", "ssl_certificate", "id_card", "document", "secret"]
+DocVaultCloudProvider = Literal["google_drive", "onedrive"]
 
 
 class DocVaultEntryBase(BaseModel):
@@ -101,6 +102,15 @@ class DocVaultAttachmentVersionResponse(DocVaultAttachmentVersionCreate):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DocVaultCloudLinkRequest(BaseModel):
+    provider: DocVaultCloudProvider
+    file_url: str = Field(min_length=1, max_length=2048)
+    file_id: str | None = Field(default=None, max_length=255)
+    file_name: str | None = Field(default=None, max_length=255)
+    file_mime_type: str | None = None
+    change_note: str | None = None
 
 
 class DocVaultSignatureCreate(BaseModel):

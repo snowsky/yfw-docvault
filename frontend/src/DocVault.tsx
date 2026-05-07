@@ -3,13 +3,16 @@ import {
   AlertCircle,
   Archive,
   BadgeCheck,
+  Cloud,
   Copy,
   CreditCard,
+  ExternalLink,
   FileKey2,
   FileText,
   History,
   IdCard,
   KeyRound,
+  Link2,
   Lock,
   PackageCheck,
   PenLine,
@@ -35,6 +38,7 @@ import { apiRequest } from '@/lib/api';
 
 type Category = 'credit_card' | 'ssl_certificate' | 'id_card' | 'document' | 'secret';
 type ExpiryStatus = 'expired' | 'expiring_soon' | 'valid';
+type DocumentSource = 'local' | 'google_drive' | 'onedrive';
 
 interface DocVaultEntry {
   id: number;
@@ -105,6 +109,10 @@ const emptyForm = {
   password: '',
   private_key: '',
   retention_years: '',
+  document_source: 'local' as DocumentSource,
+  cloud_url: '',
+  cloud_file_id: '',
+  cloud_file_name: '',
 };
 
 const tabConfig: Array<{ id: Category | 'all'; label: string; icon: React.ElementType }> = [
@@ -164,6 +172,18 @@ function fileSize(bytes?: number | null) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function cloudProviderLabel(provider?: string | null) {
+  if (provider === 'google_drive') return 'Google Drive';
+  if (provider === 'onedrive') return 'OneDrive';
+  return 'Cloud';
+}
+
+function cloudIntegration(entry: Pick<DocVaultEntry, 'public_metadata'>) {
+  return entry.public_metadata?.cloud_integration as
+    | { provider?: DocumentSource; provider_label?: string; file_url?: string; file_id?: string; file_name?: string }
+    | undefined;
 }
 
 function CardVisual({ form }: { form: typeof emptyForm }) {
@@ -343,9 +363,24 @@ export default function DocVault() {
     }
     if (activeTab === 'ssl_certificate') metadata.domain = form.domain;
     if (activeTab === 'id_card') metadata.card_type = form.card_type;
-    if (activeTab === 'document' && form.retention_years) {
-      metadata.retention_years = Number(form.retention_years);
-      metadata.retention_start_date = new Date().toISOString().slice(0, 10);
+    if (activeTab === 'document') {
+      if (form.retention_years) {
+        metadata.retention_years = Number(form.retention_years);
+        metadata.retention_start_date = new Date().toISOString().slice(0, 10);
+      }
+      if (form.document_source !== 'local') {
+        if (!form.cloud_url.trim()) {
+          toast.error(`Add a ${cloudProviderLabel(form.document_source)} share link`);
+          return;
+        }
+        metadata.cloud_integration = {
+          provider: form.document_source,
+          file_url: form.cloud_url.trim(),
+          file_id: form.cloud_file_id.trim() || null,
+          file_name: form.cloud_file_name.trim() || title || null,
+        };
+        title = title || form.cloud_file_name.trim() || cloudProviderLabel(form.document_source);
+      }
     }
     if (activeTab === 'secret') {
       sensitive.password = form.password;
@@ -371,10 +406,14 @@ export default function DocVault() {
         notes: form.notes || null,
         tags: form.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
         thumbnail_data_url: activeTab === 'id_card' ? selectedFile?.dataUrl : null,
-        file_name: selectedFile?.name || null,
-        file_mime_type: selectedFile?.type || null,
-        file_size: selectedFile?.size || null,
-        file_data_url: activeTab === 'document' ? selectedFile?.dataUrl : null,
+        file_name: activeTab === 'document' && form.document_source !== 'local'
+          ? form.cloud_file_name || title
+          : selectedFile?.name || null,
+        file_mime_type: activeTab === 'document' && form.document_source !== 'local'
+          ? 'application/vnd.docvault.cloud-link'
+          : selectedFile?.type || null,
+        file_size: activeTab === 'document' && form.document_source !== 'local' ? null : selectedFile?.size || null,
+        file_data_url: activeTab === 'document' && form.document_source === 'local' ? selectedFile?.dataUrl : null,
       }),
     });
     setForm(emptyForm);
@@ -553,15 +592,58 @@ export default function DocVault() {
                     )}
 
                     {activeTab === 'document' && (
-                      <div className="space-y-1.5">
-                        <Label>Retention years</Label>
-                        <Input
-                          type="number"
-                          min="1"
-                          placeholder="7"
-                          value={form.retention_years}
-                          onChange={(e) => setForm({ ...form, retention_years: e.target.value })}
-                        />
+                      <div className="space-y-3">
+                        <div className="space-y-1.5">
+                          <Label>Document source</Label>
+                          <Select
+                            value={form.document_source}
+                            onValueChange={(document_source) => setForm({ ...form, document_source: document_source as DocumentSource })}
+                          >
+                            <SelectTrigger><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="local">Local upload</SelectItem>
+                              <SelectItem value="google_drive">Google Drive</SelectItem>
+                              <SelectItem value="onedrive">OneDrive</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {form.document_source !== 'local' && (
+                          <>
+                            <div className="space-y-1.5">
+                              <Label className="flex items-center gap-2">
+                                <Link2 className="h-4 w-4" />
+                                {cloudProviderLabel(form.document_source)} share link
+                              </Label>
+                              <Input
+                                placeholder={form.document_source === 'google_drive' ? 'https://drive.google.com/...' : 'https://1drv.ms/...'}
+                                value={form.cloud_url}
+                                onChange={(e) => setForm({ ...form, cloud_url: e.target.value })}
+                              />
+                            </div>
+                            <div className="grid gap-3 sm:grid-cols-2">
+                              <div className="space-y-1.5">
+                                <Label>Cloud file name</Label>
+                                <Input value={form.cloud_file_name} onChange={(e) => setForm({ ...form, cloud_file_name: e.target.value })} />
+                              </div>
+                              <div className="space-y-1.5">
+                                <Label>Cloud file ID</Label>
+                                <Input value={form.cloud_file_id} onChange={(e) => setForm({ ...form, cloud_file_id: e.target.value })} />
+                              </div>
+                            </div>
+                          </>
+                        )}
+
+                        <div className="space-y-1.5">
+                          <Label>Retention years</Label>
+                          <Input
+                            type="number"
+                            min="1"
+                            placeholder="7"
+                            value={form.retention_years}
+                            onChange={(e) => setForm({ ...form, retention_years: e.target.value })}
+                          />
+                        </div>
                       </div>
                     )}
 
@@ -575,7 +657,7 @@ export default function DocVault() {
                       </div>
                     )}
 
-                    {(activeTab === 'credit_card' || activeTab === 'id_card' || activeTab === 'document') && (
+                    {(activeTab === 'credit_card' || activeTab === 'id_card' || (activeTab === 'document' && form.document_source === 'local')) && (
                       <div className="rounded-lg border border-dashed p-4">
                         <Label className="mb-2 flex items-center gap-2">
                           <Upload className="h-4 w-4" />
@@ -645,11 +727,21 @@ export default function DocVault() {
                                 {entry.category === 'credit_card' && `${entry.public_metadata.network || 'Card'} ending ${entry.sensitive_payload.last4 || '----'}`}
                                 {entry.category === 'ssl_certificate' && `${entry.public_metadata.domain || entry.title} · ${entry.issuer || 'Unknown issuer'}`}
                                 {entry.category === 'id_card' && `${entry.public_metadata.card_type || 'ID'} · ${entry.issuer || 'Unknown authority'}`}
-                                {entry.category === 'document' && `${entry.file_name || 'File'} · ${fileSize(entry.file_size)}`}
+                                {entry.category === 'document' && (
+                                  cloudIntegration(entry)
+                                    ? `${entry.file_name || 'File'} · ${cloudProviderLabel(cloudIntegration(entry)?.provider)}`
+                                    : `${entry.file_name || 'File'} · ${fileSize(entry.file_size)}`
+                                )}
                                 {entry.category === 'secret' && 'Password / private key'}
                               </div>
                               <div className="mt-2 flex flex-wrap gap-1">
                                 {entry.tags.map((tag) => <Badge key={tag} variant="secondary">{tag}</Badge>)}
+                                {cloudIntegration(entry) && (
+                                  <Badge variant="outline" className="gap-1">
+                                    <Cloud className="h-3 w-3" />
+                                    {cloudProviderLabel(cloudIntegration(entry)?.provider)}
+                                  </Badge>
+                                )}
                                 {entry.attachment_versions_count > 0 && <Badge variant="outline">{entry.attachment_versions_count} versions</Badge>}
                                 {entry.signatures_count > 0 && <Badge variant="outline">{entry.signatures_count} signatures</Badge>}
                               </div>
@@ -658,6 +750,12 @@ export default function DocVault() {
                           <div className="flex gap-2">
                             {entry.category === 'document' && (
                               <>
+                                {cloudIntegration(entry)?.file_url && (
+                                  <Button variant="outline" size="sm" onClick={() => window.open(cloudIntegration(entry)?.file_url, '_blank')}>
+                                    <ExternalLink className="mr-2 h-4 w-4" />
+                                    Open
+                                  </Button>
+                                )}
                                 <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
                                   <History className="mr-2 h-4 w-4" />
                                   History
@@ -742,7 +840,22 @@ export default function DocVault() {
                 <div className="font-semibold">{unlocked.title}</div>
                 <div className="text-sm text-muted-foreground">{unlocked.notes || 'No private notes'}</div>
               </div>
+              {cloudIntegration(unlocked)?.file_url && (
+                <div className="rounded-lg border p-3 text-sm">
+                  <div className="font-medium">{cloudProviderLabel(cloudIntegration(unlocked)?.provider)}</div>
+                  <div className="mt-1 break-all text-muted-foreground">{cloudIntegration(unlocked)?.file_url}</div>
+                  {cloudIntegration(unlocked)?.file_id && (
+                    <div className="mt-1 font-mono text-xs text-muted-foreground">{cloudIntegration(unlocked)?.file_id}</div>
+                  )}
+                </div>
+              )}
               <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(unlocked.sensitive_payload, null, 2)}</pre>
+              {cloudIntegration(unlocked)?.file_url && (
+                <Button variant="outline" onClick={() => window.open(cloudIntegration(unlocked)?.file_url, '_blank')}>
+                  <ExternalLink className="mr-2 h-4 w-4" />
+                  Open cloud file
+                </Button>
+              )}
               {unlocked.file_data_url && <Button variant="outline" onClick={() => window.open(unlocked.file_data_url!, '_blank')}>Open file</Button>}
               <Button
                 variant="outline"
