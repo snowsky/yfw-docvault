@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Document and expiry manager for cards, SSL certificates, IDs, documents, passwords, and private keys.",
   "author": "YourFinanceWORKS",
-  "license_tier": "commercial",
+  "license_tier": "agpl",
   "api_routes": [
     {
       "path": "/api/v1/docvault",

@@ -715,7 +715,9 @@ export default function DocVault() {
             <DialogTitle className="flex items-center gap-2"><Lock className="h-5 w-5" /> Unlock vault details</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">Enter your authenticator code. If MFA is disabled, type UNLOCK to confirm.</p>
+            <div className="rounded-lg border bg-muted p-3 text-sm text-muted-foreground">
+              Use your enrolled MFA chain or vault password to reveal sensitive details. If you have not configured one yet, go to Settings -> Security and set up a vault password or MFA chain first. In standalone/local fallback mode, type UNLOCK to confirm.
+            </div>
             <Select value={mfaFactor} onValueChange={setMfaFactor}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
