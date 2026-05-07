@@ -716,7 +716,7 @@ export default function DocVault() {
           </DialogHeader>
           <div className="space-y-3">
             <div className="rounded-lg border bg-muted p-3 text-sm text-muted-foreground">
-              Use your enrolled MFA chain or vault password to reveal sensitive details. If you have not configured one yet, go to Settings -> Security and set up a vault password or MFA chain first. In standalone/local fallback mode, type UNLOCK to confirm.
+              Use your enrolled MFA chain or vault password to reveal sensitive details. If you have not configured one yet, go to Settings {'>'} Security and set up a vault password or MFA chain first. In standalone/local fallback mode, type UNLOCK to confirm.
             </div>
             <Select value={mfaFactor} onValueChange={setMfaFactor}>
               <SelectTrigger><SelectValue /></SelectTrigger>
