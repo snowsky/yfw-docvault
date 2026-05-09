@@ -46,6 +46,7 @@ from .schemas import (
     DocVaultMFASetupRequest,
     DocVaultMFASetupResponse,
     DocVaultMFAVerifyRequest,
+    DocVaultSystemMFAStatusResponse,
     DocVaultRetentionRunResponse,
     DocVaultScanRequest,
     DocVaultScanResponse,
@@ -243,6 +244,48 @@ def _mfa_response(enrollment: DocVaultMFAEnrollment) -> DocVaultMFAEnrollmentRes
     )
 
 
+def _user_for_system_mfa(db: Session, current_user: MasterUser):
+    try:
+        return db.query(TenantUser).filter(TenantUser.id == current_user.id).first() or current_user
+    except Exception:
+        return current_user
+
+
+def _system_mfa_status(db: Session, current_user: MasterUser) -> DocVaultSystemMFAStatusResponse:
+    try:
+        from commercial.mfa_chain.utils import get_user_mfa_settings
+    except ModuleNotFoundError:
+        return DocVaultSystemMFAStatusResponse(
+            available=False,
+            enabled=False,
+            configured=False,
+            message="System MFA is not available in this DocVault deployment. Configure a DocVault unlock method before revealing sensitive details.",
+        )
+
+    settings = get_user_mfa_settings(_user_for_system_mfa(db, current_user))
+    enabled = bool(settings.get("enabled"))
+    enrolled_factors = list(settings.get("enrolled_factors") or [])
+    factors = list(settings.get("factors") or [])
+    configured = enabled and bool(enrolled_factors) and all(factor_id in enrolled_factors for factor_id in factors)
+    if configured:
+        message = "DocVault is using system MFA for sensitive unlocks."
+    elif enabled:
+        message = "System MFA is enabled but incomplete. Finish authenticator enrollment or disable MFA with the admin script."
+    else:
+        message = "System MFA is not enabled. Configure MFA in your profile, enroll a DocVault authenticator, or use the admin script to disable MFA."
+
+    return DocVaultSystemMFAStatusResponse(
+        available=True,
+        enabled=enabled,
+        configured=configured,
+        mode=settings.get("mode"),
+        factors=factors,
+        enrolled_factors=enrolled_factors,
+        supported_factors=list(settings.get("supported_factors") or []),
+        message=message,
+    )
+
+
 def _latest_version_number(db: Session, entry_id: int) -> int:
     latest = (
         db.query(DocVaultAttachmentVersion)
@@ -286,6 +329,37 @@ def _create_attachment_version(
 
 def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRequest) -> None:
     local_unlock_factors = {"local_fallback", "vault_password", "recovery_code"}
+
+    try:
+        from commercial.mfa_chain.utils import get_user_mfa_settings, verify_factor_enrollment
+    except ModuleNotFoundError:
+        get_user_mfa_settings = None
+        verify_factor_enrollment = None
+
+    if get_user_mfa_settings and verify_factor_enrollment:
+        user_for_mfa = _user_for_system_mfa(db, current_user)
+        settings = get_user_mfa_settings(user_for_mfa)
+    else:
+        settings = {"enabled": False, "factors": [], "enrolled_factors": []}
+
+    system_configured = bool(settings.get("enabled")) and bool(settings.get("enrolled_factors")) and all(
+        factor_id in settings.get("enrolled_factors", []) for factor_id in settings.get("factors", [])
+    )
+    if system_configured:
+        if payload.factor_id in local_unlock_factors:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Use an enrolled MFA factor for this vault")
+        if payload.factor_id not in settings.get("enrolled_factors", []):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Authenticator is not enrolled")
+        if not verify_factor_enrollment(user_for_mfa, payload.factor_id, payload.user_input, payload.window):  # type: ignore[misc]
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authenticator code")
+        return
+
+    if settings.get("enabled"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="System MFA is enabled but incomplete. Finish enrollment or disable MFA before unlocking DocVault.",
+        )
+
     enrollment = db.query(DocVaultMFAEnrollment).filter(
         DocVaultMFAEnrollment.user_id == current_user.id,
         DocVaultMFAEnrollment.factor_id == payload.factor_id,
@@ -296,28 +370,7 @@ def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRe
             return
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authenticator code")
 
-    try:
-        from commercial.mfa_chain.utils import get_user_mfa_settings, verify_factor_enrollment
-    except ModuleNotFoundError:
-        if payload.factor_id == "local_fallback" and payload.user_input == "UNLOCK":
-            return
-        if payload.factor_id in {"vault_password", "recovery_code"} and payload.user_input.strip():
-            return
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="MFA library is unavailable. Use a local unlock method or type UNLOCK in local fallback mode.",
-        )
-
-    tenant_user = db.query(TenantUser).filter(TenantUser.id == current_user.id).first()
-    user_for_mfa = tenant_user or current_user
-    settings = get_user_mfa_settings(user_for_mfa)
-    if settings.get("enabled"):
-        if payload.factor_id in local_unlock_factors:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Use an enrolled MFA factor for this vault")
-        if payload.factor_id not in settings.get("enrolled_factors", []):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Authenticator is not enrolled")
-        if not verify_factor_enrollment(user_for_mfa, payload.factor_id, payload.user_input, payload.window):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authenticator code")
+    if payload.factor_id in {"vault_password", "recovery_code"} and payload.user_input.strip():
         return
 
     if payload.user_input != "UNLOCK":
@@ -345,6 +398,14 @@ async def list_entries(
     if tag:
         entries = [entry for entry in entries if tag in (entry.tags or [])]
     return [_serialize_with_counts(db, entry) for entry in sorted(entries, key=_sort_key)]
+
+
+@router.get("/mfa/status", response_model=DocVaultSystemMFAStatusResponse)
+async def get_mfa_status(
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    return _system_mfa_status(db, current_user)
 
 
 @router.get("/mfa/enrollments", response_model=list[DocVaultMFAEnrollmentResponse])

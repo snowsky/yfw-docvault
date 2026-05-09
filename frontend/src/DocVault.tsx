@@ -117,6 +117,19 @@ interface MfaSetup {
   is_verified: boolean;
 }
 
+interface SystemMfaStatus {
+  available: boolean;
+  enabled: boolean;
+  configured: boolean;
+  mode?: string | null;
+  factors: string[];
+  enrolled_factors: string[];
+  supported_factors: Array<{ id: string; label: string; type?: string }>;
+  message: string;
+  settings_path: string;
+  disable_script: string;
+}
+
 const emptyForm = {
   title: '',
   owner_name: '',
@@ -298,6 +311,7 @@ export default function DocVault() {
   const [passwordConfirmDraft, setPasswordConfirmDraft] = React.useState('');
   const [recoveryCodesDraft, setRecoveryCodesDraft] = React.useState('');
   const [mfaEnrollments, setMfaEnrollments] = React.useState<MfaEnrollment[]>([]);
+  const [systemMfaStatus, setSystemMfaStatus] = React.useState<SystemMfaStatus | null>(null);
   const [mfaSetup, setMfaSetup] = React.useState<MfaSetup | null>(null);
   const [mfaVerifyCode, setMfaVerifyCode] = React.useState('');
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
@@ -338,6 +352,12 @@ export default function DocVault() {
   };
   const activeTabConfig = tabConfig.find((tab) => tab.id === activeTab) || tabConfig[0];
   const selectedUnlockMethod = unlockMethods.find((method) => method.id === unlockMethod) || unlockMethods[0];
+  const usesSystemMfa = Boolean(systemMfaStatus?.available && systemMfaStatus.configured);
+  const systemUnlockMethods = unlockMethods.filter((method) => systemMfaStatus?.enrolled_factors.includes(method.factorId));
+  const availableUnlockMethods = usesSystemMfa && systemUnlockMethods.length > 0 ? systemUnlockMethods : unlockMethods;
+  const systemMfaFactorLabels = (systemMfaStatus?.enrolled_factors || [])
+    .map((factorId) => systemMfaStatus?.supported_factors.find((factor) => factor.id === factorId)?.label || factorId)
+    .join(', ');
 
   React.useEffect(() => {
     setPage(1);
@@ -353,6 +373,7 @@ export default function DocVault() {
 
   React.useEffect(() => {
     if (!settingsOpen) return;
+    loadMfaStatus().catch((error) => toast.error(error.message || 'Failed to load MFA status'));
     loadMfaEnrollments().catch((error) => toast.error(error.message || 'Failed to load MFA enrollment'));
   }, [settingsOpen]);
 
@@ -443,6 +464,34 @@ export default function DocVault() {
     });
     setAuditPackage(data);
     toast.success('Audit package generated');
+  }
+
+  function applySystemMfaDefaults(status: SystemMfaStatus) {
+    if (!status.available || !status.configured) return;
+    setUnlockSettings((current) => {
+      const next = { ...current, enabled: { ...current.enabled } };
+      next.enabled.mfa_google = status.enrolled_factors.includes('google_auth');
+      next.enabled.mfa_microsoft = status.enrolled_factors.includes('ms_auth');
+      next.enabled.local_confirmation = false;
+      next.googleAccount = status.enrolled_factors.includes('google_auth') ? 'System MFA' : next.googleAccount;
+      next.microsoftAccount = status.enrolled_factors.includes('ms_auth') ? 'System MFA' : next.microsoftAccount;
+      return next;
+    });
+    const preferred = status.enrolled_factors.includes('google_auth')
+      ? 'mfa_google'
+      : status.enrolled_factors.includes('ms_auth')
+        ? 'mfa_microsoft'
+        : null;
+    if (preferred) {
+      setUnlockMethod((current) => (status.enrolled_factors.includes(selectedUnlockMethod.factorId) ? current : preferred));
+      setSettingsMethod(preferred);
+    }
+  }
+
+  async function loadMfaStatus() {
+    const data = await apiRequest<SystemMfaStatus>('/docvault/mfa/status');
+    setSystemMfaStatus(data);
+    applySystemMfaDefaults(data);
   }
 
   async function loadMfaEnrollments() {
@@ -1163,6 +1212,23 @@ export default function DocVault() {
               Vault settings
             </DialogTitle>
           </DialogHeader>
+          {systemMfaStatus && (
+            <div className={`rounded-lg border p-3 text-sm ${usesSystemMfa ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
+              <div className="font-semibold">{usesSystemMfa ? 'Using system MFA' : 'System MFA setup needed'}</div>
+              <div className="mt-1">{systemMfaStatus.message}</div>
+              {usesSystemMfa && systemMfaFactorLabels && (
+                <div className="mt-1 text-xs">Active factors: {systemMfaFactorLabels}</div>
+              )}
+              {!usesSystemMfa && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" onClick={() => window.location.assign(systemMfaStatus.settings_path)}>
+                    Configure system MFA
+                  </Button>
+                  <Badge variant="outline" className="bg-white font-mono">{systemMfaStatus.disable_script}</Badge>
+                </div>
+              )}
+            </div>
+          )}
           <div className="grid gap-5 lg:grid-cols-[240px_minmax(0,1fr)]">
             <div className="space-y-3">
               <div className="space-y-1.5">
@@ -1170,7 +1236,7 @@ export default function DocVault() {
                 <Select value={unlockMethod} onValueChange={(value) => setUnlockMethod(value as UnlockMethod)}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    {unlockMethods.map((method) => (
+                    {availableUnlockMethods.map((method) => (
                       <SelectItem key={method.id} value={method.id}>{method.label}</SelectItem>
                     ))}
                   </SelectContent>
@@ -1185,7 +1251,11 @@ export default function DocVault() {
                     onClick={() => setSettingsMethod(method.id)}
                   >
                     <div className="font-semibold">{method.label}</div>
-                    <div className="text-sm text-muted-foreground">{unlockSettings.enabled[method.id] ? 'Enabled' : 'Not set up'}</div>
+                    <div className="text-sm text-muted-foreground">
+                      {usesSystemMfa && systemMfaStatus?.enrolled_factors.includes(method.factorId)
+                        ? 'System MFA'
+                        : unlockSettings.enabled[method.id] ? 'Enabled' : 'Not set up'}
+                    </div>
                   </button>
                 ))}
               </div>
@@ -1201,16 +1271,25 @@ export default function DocVault() {
                   <input
                     type="checkbox"
                     checked={unlockSettings.enabled[settingsMethod]}
+                    disabled={usesSystemMfa}
                     onChange={(event) => updateUnlockEnabled(settingsMethod, event.target.checked)}
                   />
-                  Enabled
+                  {usesSystemMfa ? 'Managed by system MFA' : 'Enabled'}
                 </label>
               </div>
 
               {settingsMethod === 'mfa_google' && (
                 <div className="space-y-3">
+                  {usesSystemMfa ? (
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      {systemMfaStatus?.enrolled_factors.includes('google_auth')
+                        ? 'Google Authenticator is managed by system MFA. Use the code from your system MFA enrollment to unlock DocVault details.'
+                        : 'Google Authenticator is not part of your system MFA chain. Add it in profile settings before using it for DocVault.'}
+                    </div>
+                  ) : (
+                    <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
-                    Scan the QR code with Google Authenticator, then enter the current 6-digit code to verify enrollment.
+                    System MFA is not configured for Google Authenticator. Configure it in profile settings, enroll a DocVault authenticator here, or disable MFA with the admin script.
                   </div>
                   <div className="space-y-1.5">
                     <Label>Account label</Label>
@@ -1240,13 +1319,23 @@ export default function DocVault() {
                   <Button onClick={() => startMfaEnrollment('mfa_google').catch((error) => toast.error(error.message || 'Enrollment failed'))}>
                     Generate QR code
                   </Button>
+                    </>
+                  )}
                 </div>
               )}
 
               {settingsMethod === 'mfa_microsoft' && (
                 <div className="space-y-3">
+                  {usesSystemMfa ? (
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      {systemMfaStatus?.enrolled_factors.includes('ms_auth')
+                        ? 'Microsoft Authenticator is managed by system MFA. Use the code from your system MFA enrollment to unlock DocVault details.'
+                        : 'Microsoft Authenticator is not part of your system MFA chain. Add it in profile settings before using it for DocVault.'}
+                    </div>
+                  ) : (
+                    <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
-                    Scan the QR code with Microsoft Authenticator, then enter the current 6-digit code to verify enrollment.
+                    System MFA is not configured for Microsoft Authenticator. Configure it in profile settings, enroll a DocVault authenticator here, or disable MFA with the admin script.
                   </div>
                   <div className="space-y-1.5">
                     <Label>Account label</Label>
@@ -1276,11 +1365,19 @@ export default function DocVault() {
                   <Button onClick={() => startMfaEnrollment('mfa_microsoft').catch((error) => toast.error(error.message || 'Enrollment failed'))}>
                     Generate QR code
                   </Button>
+                    </>
+                  )}
                 </div>
               )}
 
               {settingsMethod === 'vault_password' && (
                 <div className="space-y-3">
+                  {usesSystemMfa ? (
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      Vault password unlock is disabled while DocVault is using system MFA.
+                    </div>
+                  ) : (
+                    <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
                     Set a vault password for standalone unlock. In this local plugin view, only setup state is stored locally.
                   </div>
@@ -1296,11 +1393,19 @@ export default function DocVault() {
                   </div>
                   {unlockSettings.passwordSet && <Badge variant="outline">Password configured</Badge>}
                   <Button onClick={savePasswordMethod}>Save vault password</Button>
+                    </>
+                  )}
                 </div>
               )}
 
               {settingsMethod === 'recovery_code' && (
                 <div className="space-y-3">
+                  {usesSystemMfa ? (
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      Recovery-code unlock is disabled while DocVault is using system MFA.
+                    </div>
+                  ) : (
+                    <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
                     Add recovery codes separated by spaces or new lines. Store them somewhere safe before closing settings.
                   </div>
@@ -1314,11 +1419,19 @@ export default function DocVault() {
                   </div>
                   {unlockSettings.recoveryCodeCount > 0 && <Badge variant="outline">{unlockSettings.recoveryCodeCount} codes configured</Badge>}
                   <Button onClick={saveRecoveryCodes}>Save recovery codes</Button>
+                    </>
+                  )}
                 </div>
               )}
 
               {settingsMethod === 'local_confirmation' && (
                 <div className="space-y-3">
+                  {usesSystemMfa ? (
+                    <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
+                      Local confirmation is disabled while DocVault is using system MFA.
+                    </div>
+                  ) : (
+                    <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
                     Local confirmation is intended for standalone development and self-hosted fallback mode. Users type UNLOCK to reveal details.
                   </div>
@@ -1328,6 +1441,8 @@ export default function DocVault() {
                   }}>
                     Enable local confirmation
                   </Button>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -1351,7 +1466,7 @@ export default function DocVault() {
             <Select value={unlockMethod} onValueChange={(value) => setUnlockMethod(value as UnlockMethod)}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                {unlockMethods.map((method) => (
+                {availableUnlockMethods.map((method) => (
                   <SelectItem key={method.id} value={method.id}>{method.label}</SelectItem>
                 ))}
               </SelectContent>
