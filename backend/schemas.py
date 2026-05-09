@@ -98,6 +98,19 @@ class DocVaultMFAEnrollmentResponse(BaseModel):
     verified_at: datetime | None = None
 
 
+class DocVaultSystemMFAStatusResponse(BaseModel):
+    available: bool
+    enabled: bool
+    configured: bool
+    mode: str | None = None
+    factors: list[str] = Field(default_factory=list)
+    enrolled_factors: list[str] = Field(default_factory=list)
+    supported_factors: list[dict[str, Any]] = Field(default_factory=list)
+    message: str
+    settings_path: str = "/settings?tab=profile"
+    disable_script: str = "api/scripts/disable_user_mfa.py"
+
+
 class DocVaultScanRequest(BaseModel):
     category: Literal["credit_card", "id_card"]
     file_name: str | None = None
