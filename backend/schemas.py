@@ -94,8 +94,15 @@ class DocVaultMFAEnrollmentResponse(BaseModel):
     factor_id: str
     label: str | None = None
     is_verified: bool
+    recovery_code_count: int = 0
     created_at: datetime
     verified_at: datetime | None = None
+
+
+class DocVaultLocalUnlockSetupRequest(BaseModel):
+    factor_id: Literal["vault_password", "recovery_code", "local_fallback"]
+    secret: str | None = Field(default=None, min_length=1)
+    codes: list[str] = Field(default_factory=list)
 
 
 class DocVaultSystemMFAStatusResponse(BaseModel):

@@ -43,6 +43,7 @@ from .schemas import (
     DocVaultEntryResponse,
     DocVaultEntryUpdate,
     DocVaultMFAEnrollmentResponse,
+    DocVaultLocalUnlockSetupRequest,
     DocVaultMFASetupRequest,
     DocVaultMFASetupResponse,
     DocVaultMFAVerifyRequest,
@@ -89,6 +90,49 @@ def _mask_entry_payload(category: str, payload: dict[str, Any] | None) -> dict[s
 
 def _checksum(data: str | None) -> str:
     return hashlib.sha256((data or "").encode("utf-8")).hexdigest()
+
+
+def _normalize_unlock_secret(value: str) -> str:
+    return value.strip()
+
+
+def _hash_unlock_secret(value: str, salt: str) -> str:
+    return hashlib.sha256(f"{salt}:{_normalize_unlock_secret(value)}".encode("utf-8")).hexdigest()
+
+
+def _local_secret_payload(values: list[str]) -> dict[str, Any]:
+    salt = secrets.token_hex(16)
+    normalized = [_normalize_unlock_secret(value) for value in values if _normalize_unlock_secret(value)]
+    return {
+        "salt": salt,
+        "hashes": [_hash_unlock_secret(value, salt) for value in normalized],
+    }
+
+
+def _parse_local_secret_payload(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {"salt": "", "hashes": []}
+    if not raw.startswith("{"):
+        return {"salt": "", "hashes": [raw]}
+    try:
+        import json
+
+        parsed = json.loads(raw)
+    except Exception:
+        return {"salt": "", "hashes": []}
+    return {
+        "salt": str(parsed.get("salt") or ""),
+        "hashes": [str(value) for value in parsed.get("hashes") or []],
+    }
+
+
+def _verify_local_secret(enrollment: DocVaultMFAEnrollment, value: str) -> bool:
+    payload = _parse_local_secret_payload(enrollment.secret)
+    salt = payload.get("salt") or ""
+    if not salt:
+        return False
+    candidate = _hash_unlock_secret(value, salt)
+    return any(hmac.compare_digest(candidate, saved) for saved in payload.get("hashes") or [])
 
 
 def _provider_label(provider: str) -> str:
@@ -145,6 +189,30 @@ def _signature_response(signature: DocVaultSignature) -> DocVaultSignatureRespon
     )
 
 
+def _public_metadata_for_response(entry: DocVaultEntry, reveal: bool) -> dict[str, Any]:
+    metadata = dict(entry.public_metadata or {})
+    cloud_integration = metadata.get("cloud_integration")
+    if reveal or not isinstance(cloud_integration, dict):
+        return metadata
+
+    metadata["cloud_integration"] = {
+        key: cloud_integration.get(key)
+        for key in ("provider", "provider_label", "file_name", "linked_at")
+        if cloud_integration.get(key) is not None
+    }
+    return metadata
+
+
+def _has_sensitive_material(entry: DocVaultEntry) -> bool:
+    cloud_integration = (entry.public_metadata or {}).get("cloud_integration")
+    return bool(
+        entry.sensitive_payload
+        or entry.file_data_url
+        or entry.notes
+        or (isinstance(cloud_integration, dict) and cloud_integration.get("file_url"))
+    )
+
+
 def _serialize(entry: DocVaultEntry, reveal: bool = False) -> DocVaultEntryResponse:
     status_name, days_delta, alerting = _expiry_status(entry.category, entry.expiry_date)
     payload = dict(entry.sensitive_payload or {}) if reveal else _mask_entry_payload(entry.category, entry.sensitive_payload)
@@ -156,7 +224,7 @@ def _serialize(entry: DocVaultEntry, reveal: bool = False) -> DocVaultEntryRespo
         issuer=entry.issuer,
         expiry_date=entry.expiry_date,
         issue_date=entry.issue_date,
-        public_metadata=entry.public_metadata or {},
+        public_metadata=_public_metadata_for_response(entry, reveal),
         sensitive_payload=payload,
         notes=entry.notes if reveal else None,
         tags=entry.tags or [],
@@ -172,7 +240,7 @@ def _serialize(entry: DocVaultEntry, reveal: bool = False) -> DocVaultEntryRespo
         expiry_status=status_name,
         days_delta=days_delta,
         alerting=alerting,
-        sensitive_available=bool(entry.sensitive_payload or entry.file_data_url or entry.notes),
+        sensitive_available=_has_sensitive_material(entry),
         attachment_versions_count=0,
         signatures_count=0,
     )
@@ -235,10 +303,14 @@ def _qr_data_url(value: str) -> str | None:
 
 
 def _mfa_response(enrollment: DocVaultMFAEnrollment) -> DocVaultMFAEnrollmentResponse:
+    recovery_code_count = 0
+    if enrollment.factor_id == "recovery_code":
+        recovery_code_count = len(_parse_local_secret_payload(enrollment.secret).get("hashes") or [])
     return DocVaultMFAEnrollmentResponse(
         factor_id=enrollment.factor_id,
         label=enrollment.label,
         is_verified=enrollment.is_verified,
+        recovery_code_count=recovery_code_count,
         created_at=enrollment.created_at,
         verified_at=enrollment.verified_at,
     )
@@ -366,18 +438,15 @@ def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRe
         DocVaultMFAEnrollment.is_verified.is_(True),
     ).first()
     if enrollment:
+        if payload.factor_id in local_unlock_factors:
+            if _verify_local_secret(enrollment, payload.user_input):
+                return
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid unlock secret")
         if _verify_totp(enrollment.secret, payload.user_input, payload.window):
             return
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authenticator code")
 
-    if payload.factor_id in {"vault_password", "recovery_code"} and payload.user_input.strip():
-        return
-
-    if payload.user_input != "UNLOCK":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="MFA is not enabled. Type UNLOCK to confirm this sensitive action.",
-        )
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This unlock method is not configured")
 
 
 @router.get("", response_model=list[DocVaultEntryResponse])
@@ -477,6 +546,71 @@ async def verify_mfa_enrollment(
     db.commit()
     db.refresh(enrollment)
     return _mfa_response(enrollment)
+
+
+@router.post("/mfa/local-unlock", response_model=DocVaultMFAEnrollmentResponse)
+async def setup_local_unlock_method(
+    payload: DocVaultLocalUnlockSetupRequest,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    if payload.factor_id == "vault_password":
+        values = [payload.secret or ""]
+        label = "Vault password"
+    elif payload.factor_id == "recovery_code":
+        values = payload.codes
+        label = "Recovery codes"
+    else:
+        values = ["UNLOCK"]
+        label = "Local confirmation"
+    normalized = [_normalize_unlock_secret(value) for value in values if _normalize_unlock_secret(value)]
+    if not normalized:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Add at least one unlock secret")
+
+    import json
+
+    enrollment = db.query(DocVaultMFAEnrollment).filter(
+        DocVaultMFAEnrollment.user_id == current_user.id,
+        DocVaultMFAEnrollment.factor_id == payload.factor_id,
+    ).first()
+    secret = json.dumps(_local_secret_payload(normalized))
+    now = datetime.now(timezone.utc)
+    if enrollment:
+        enrollment.label = label
+        enrollment.secret = secret
+        enrollment.is_verified = True
+        enrollment.verified_at = now
+    else:
+        enrollment = DocVaultMFAEnrollment(
+            user_id=current_user.id,
+            factor_id=payload.factor_id,
+            label=label,
+            secret=secret,
+            is_verified=True,
+            verified_at=now,
+        )
+    db.add(enrollment)
+    db.commit()
+    db.refresh(enrollment)
+    return _mfa_response(enrollment)
+
+
+@router.delete("/mfa/local-unlock/{factor_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def disable_local_unlock_method(
+    factor_id: str,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    if factor_id not in {"vault_password", "recovery_code", "local_fallback"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown local unlock method")
+    enrollment = db.query(DocVaultMFAEnrollment).filter(
+        DocVaultMFAEnrollment.user_id == current_user.id,
+        DocVaultMFAEnrollment.factor_id == factor_id,
+    ).first()
+    if enrollment:
+        db.delete(enrollment)
+        db.commit()
+    return None
 
 
 @router.post("", response_model=DocVaultEntryResponse, status_code=status.HTTP_201_CREATED)

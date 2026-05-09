@@ -104,6 +104,7 @@ interface MfaEnrollment {
   factor_id: string;
   label?: string | null;
   is_verified: boolean;
+  recovery_code_count?: number;
   created_at: string;
   verified_at?: string | null;
 }
@@ -202,7 +203,7 @@ const defaultUnlockSettings: UnlockSettings = {
     mfa_microsoft: false,
     vault_password: false,
     recovery_code: false,
-    local_confirmation: true,
+    local_confirmation: false,
   },
   googleAccount: '',
   microsoftAccount: '',
@@ -580,6 +581,7 @@ export default function DocVault() {
   const [passwordDraft, setPasswordDraft] = React.useState('');
   const [passwordConfirmDraft, setPasswordConfirmDraft] = React.useState('');
   const [recoveryCodesDraft, setRecoveryCodesDraft] = React.useState('');
+  const [replacingRecoveryCodes, setReplacingRecoveryCodes] = React.useState(false);
   const [mfaEnrollments, setMfaEnrollments] = React.useState<MfaEnrollment[]>([]);
   const [systemMfaStatus, setSystemMfaStatus] = React.useState<SystemMfaStatus | null>(null);
   const [mfaSetup, setMfaSetup] = React.useState<MfaSetup | null>(null);
@@ -592,6 +594,8 @@ export default function DocVault() {
   const [signatures, setSignatures] = React.useState<SignatureRecord[]>([]);
   const [signatureForm, setSignatureForm] = React.useState({ signer_name: '', signer_email: '', provider: 'manual', signature_reference: '' });
   const [auditPackage, setAuditPackage] = React.useState<Record<string, any> | null>(null);
+  const [pendingDelete, setPendingDelete] = React.useState<DocVaultEntry | null>(null);
+  const [deleteBusy, setDeleteBusy] = React.useState(false);
   const titleInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const loadEntries = React.useCallback(async () => {
@@ -624,8 +628,17 @@ export default function DocVault() {
   const activeTabConfig = tabConfig.find((tab) => tab.id === activeTab) || tabConfig[0];
   const selectedUnlockMethod = unlockMethods.find((method) => method.id === unlockMethod) || unlockMethods[0];
   const usesSystemMfa = Boolean(systemMfaStatus?.available && systemMfaStatus.configured);
-  const systemUnlockMethods = unlockMethods.filter((method) => systemMfaStatus?.enrolled_factors.includes(method.factorId));
-  const availableUnlockMethods = usesSystemMfa && systemUnlockMethods.length > 0 ? systemUnlockMethods : unlockMethods;
+  const systemUnlockMethods = React.useMemo(
+    () => unlockMethods.filter((method) => systemMfaStatus?.enrolled_factors.includes(method.factorId)),
+    [systemMfaStatus],
+  );
+  const localUnlockMethods = React.useMemo(
+    () => unlockMethods.filter((method) => mfaEnrollments.some((enrollment) => (
+      enrollment.factor_id === method.factorId && enrollment.is_verified
+    ))),
+    [mfaEnrollments],
+  );
+  const availableUnlockMethods = usesSystemMfa && systemUnlockMethods.length > 0 ? systemUnlockMethods : localUnlockMethods;
   const systemMfaFactorLabels = (systemMfaStatus?.enrolled_factors || [])
     .map((factorId) => systemMfaStatus?.supported_factors.find((factor) => factor.id === factorId)?.label || factorId)
     .join(', ');
@@ -641,6 +654,29 @@ export default function DocVault() {
   React.useEffect(() => {
     window.localStorage.setItem('docvault.unlockSettings', JSON.stringify(unlockSettings));
   }, [unlockSettings]);
+
+  React.useEffect(() => {
+    loadMfaStatus().catch(() => undefined);
+    loadMfaEnrollments().catch(() => undefined);
+  }, []);
+
+  React.useEffect(() => {
+    if (!availableUnlockMethods.some((method) => method.id === unlockMethod)) {
+      setUnlockMethod(availableUnlockMethods[0]?.id || 'mfa_google');
+    }
+  }, [availableUnlockMethods, unlockMethod]);
+
+  React.useEffect(() => {
+    setMfaCode('');
+  }, [unlockMethod, unlocking]);
+
+  React.useEffect(() => {
+    setPasswordDraft('');
+    setPasswordConfirmDraft('');
+    setRecoveryCodesDraft('');
+    setReplacingRecoveryCodes(false);
+    setMfaVerifyCode('');
+  }, [settingsMethod, settingsOpen]);
 
   React.useEffect(() => {
     if (!settingsOpen) return;
@@ -792,6 +828,11 @@ export default function DocVault() {
     setMfaEnrollments(data);
     setUnlockSettings((current) => {
       const next = { ...current, enabled: { ...current.enabled } };
+      next.passwordSet = false;
+      next.recoveryCodeCount = 0;
+      next.enabled.vault_password = false;
+      next.enabled.recovery_code = false;
+      next.enabled.local_confirmation = false;
       data.forEach((enrollment) => {
         if (enrollment.factor_id === 'google_auth' && enrollment.is_verified) {
           next.enabled.mfa_google = true;
@@ -800,6 +841,17 @@ export default function DocVault() {
         if (enrollment.factor_id === 'ms_auth' && enrollment.is_verified) {
           next.enabled.mfa_microsoft = true;
           next.microsoftAccount = enrollment.label || next.microsoftAccount;
+        }
+        if (enrollment.factor_id === 'vault_password' && enrollment.is_verified) {
+          next.enabled.vault_password = true;
+          next.passwordSet = true;
+        }
+        if (enrollment.factor_id === 'recovery_code' && enrollment.is_verified) {
+          next.enabled.recovery_code = true;
+          next.recoveryCodeCount = enrollment.recovery_code_count || next.recoveryCodeCount;
+        }
+        if (enrollment.factor_id === 'local_fallback' && enrollment.is_verified) {
+          next.enabled.local_confirmation = true;
         }
       });
       return next;
@@ -930,6 +982,19 @@ export default function DocVault() {
     toast.success('Entry removed');
   }
 
+  async function confirmDeleteEntry() {
+    if (!pendingDelete) return;
+    setDeleteBusy(true);
+    try {
+      await deleteEntry(pendingDelete);
+      setPendingDelete(null);
+    } catch (error: any) {
+      toast.error(error.message || 'Delete failed');
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
   async function unlockEntry() {
     if (!unlocking) return;
     if (!unlockSettings.enabled[unlockMethod]) {
@@ -949,7 +1014,7 @@ export default function DocVault() {
     setUnlockSettings((current) => ({ ...current, enabled: { ...current.enabled, [method]: enabled } }));
   }
 
-  function savePasswordMethod() {
+  async function savePasswordMethod() {
     if (passwordDraft.length < 8) {
       toast.error('Use at least 8 characters for the vault password');
       return;
@@ -958,32 +1023,79 @@ export default function DocVault() {
       toast.error('Vault passwords do not match');
       return;
     }
+    await apiRequest<MfaEnrollment>('/docvault/mfa/local-unlock', {
+      method: 'POST',
+      body: JSON.stringify({ factor_id: 'vault_password', secret: passwordDraft }),
+    });
+    await loadMfaEnrollments();
     setUnlockSettings((current) => ({
       ...current,
       passwordSet: true,
       enabled: { ...current.enabled, vault_password: true },
     }));
+    setUnlockMethod('vault_password');
     setPasswordDraft('');
     setPasswordConfirmDraft('');
     toast.success('Vault password method set up');
   }
 
-  function saveRecoveryCodes() {
+  async function saveRecoveryCodes() {
     const codes = recoveryCodesDraft.split(/\s+/).map((code) => code.trim()).filter(Boolean);
     if (codes.length === 0) {
       toast.error('Add at least one recovery code');
       return;
     }
+    const enrollment = await apiRequest<MfaEnrollment>('/docvault/mfa/local-unlock', {
+      method: 'POST',
+      body: JSON.stringify({ factor_id: 'recovery_code', codes }),
+    });
+    await loadMfaEnrollments();
     setUnlockSettings((current) => ({
       ...current,
-      recoveryCodeCount: codes.length,
+      recoveryCodeCount: enrollment.recovery_code_count || codes.length,
       enabled: { ...current.enabled, recovery_code: true },
     }));
     setRecoveryCodesDraft('');
+    setReplacingRecoveryCodes(false);
     toast.success('Recovery code method set up');
   }
 
+  async function enableLocalConfirmation() {
+    await apiRequest<MfaEnrollment>('/docvault/mfa/local-unlock', {
+      method: 'POST',
+      body: JSON.stringify({ factor_id: 'local_fallback' }),
+    });
+    await loadMfaEnrollments();
+    setUnlockMethod('local_confirmation');
+    toast.warning('Local confirmation is enabled. Anyone with this session can unlock by typing UNLOCK.');
+  }
+
+  async function disableLocalUnlockMethod(method: UnlockMethod) {
+    const factorId = unlockMethods.find((item) => item.id === method)?.factorId;
+    if (!factorId || !['vault_password', 'recovery_code', 'local_fallback'].includes(factorId)) return;
+    await apiRequest(`/docvault/mfa/local-unlock/${factorId}`, { method: 'DELETE' });
+    await loadMfaEnrollments();
+    if (unlockMethod === method) {
+      setUnlockMethod(availableUnlockMethods.find((item) => item.id !== method)?.id || 'mfa_google');
+    }
+    setUnlockSettings((current) => ({
+      ...current,
+      passwordSet: method === 'vault_password' ? false : current.passwordSet,
+      recoveryCodeCount: method === 'recovery_code' ? 0 : current.recoveryCodeCount,
+      enabled: { ...current.enabled, [method]: false },
+    }));
+    if (method === 'recovery_code') {
+      setReplacingRecoveryCodes(false);
+    }
+    toast.success(`${unlockMethods.find((item) => item.id === method)?.label || 'Unlock method'} disabled`);
+  }
+
   function startNewEntry(category: Category = activeTab) {
+    if (availableUnlockMethods.length === 0) {
+      setSettingsOpen(true);
+      toast.warning('Enable at least one unlock method before adding vault items.');
+      return;
+    }
     setActiveTab(category);
     setForm(emptyForm);
     setSelectedFile(null);
@@ -1153,8 +1265,8 @@ export default function DocVault() {
                       <div className="flex flex-wrap gap-2 md:justify-end">
                         {entry.category === 'document' && (
                           <>
-                            {cloudIntegration(entry)?.file_url && (
-                              <Button variant="outline" size="sm" onClick={() => window.open(cloudIntegration(entry)?.file_url, '_blank')}>
+                            {(entry.file_name || cloudIntegration(entry)) && (
+                              <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
                                 <ExternalLink className="mr-2 h-4 w-4" />
                                 Open
                               </Button>
@@ -1173,7 +1285,7 @@ export default function DocVault() {
                           <Lock className="mr-2 h-4 w-4" />
                           Details
                         </Button>
-                        <Button variant="ghost" size="icon" onClick={() => deleteEntry(entry).catch((error) => toast.error(error.message || 'Delete failed'))}>
+                        <Button variant="ghost" size="icon" aria-label={`Delete ${entry.title}`} onClick={() => setPendingDelete(entry)}>
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>
@@ -1216,6 +1328,35 @@ export default function DocVault() {
           </CardContent>
         </Card>
       </div>
+
+      <Dialog open={!!pendingDelete} onOpenChange={(open) => !open && !deleteBusy && setPendingDelete(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Trash2 className="h-5 w-5 text-red-600" />
+              Delete entry
+            </DialogTitle>
+          </DialogHeader>
+          <div className="mt-4 space-y-4">
+            <p className="text-sm text-slate-600">
+              Delete <span className="font-semibold text-slate-900">{pendingDelete?.title}</span> from DocVault? This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" type="button" disabled={deleteBusy} onClick={() => setPendingDelete(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                disabled={deleteBusy}
+                className="border-red-600 bg-red-600 hover:border-red-700 hover:bg-red-700"
+                onClick={() => confirmDeleteEntry()}
+              >
+                {deleteBusy ? 'Deleting...' : 'Delete'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={wizardOpen} onOpenChange={(open) => !open && closeWizard()}>
         <DialogContent className="max-w-3xl">
@@ -1574,6 +1715,14 @@ export default function DocVault() {
                     ))}
                   </SelectContent>
                 </Select>
+                {availableUnlockMethods.length === 0 && (
+                  <div className="text-xs text-amber-700">Set up an unlock method before opening vault details.</div>
+                )}
+                {unlockSettings.enabled.local_confirmation && (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                    Local confirmation is enabled and should only be used as a standalone fallback.
+                  </div>
+                )}
               </div>
               <div className="grid gap-2">
                 {unlockMethods.map((method) => (
@@ -1604,10 +1753,10 @@ export default function DocVault() {
                   <input
                     type="checkbox"
                     checked={unlockSettings.enabled[settingsMethod]}
-                    disabled={usesSystemMfa}
+                    disabled={usesSystemMfa || settingsMethod === 'local_confirmation'}
                     onChange={(event) => updateUnlockEnabled(settingsMethod, event.target.checked)}
                   />
-                  {usesSystemMfa ? 'Managed by system MFA' : 'Enabled'}
+                  {usesSystemMfa ? 'Managed by system MFA' : settingsMethod === 'local_confirmation' ? 'Use controls below' : 'Enabled'}
                 </label>
               </div>
 
@@ -1709,6 +1858,30 @@ export default function DocVault() {
                     <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
                       Vault password unlock is disabled while DocVault is using system MFA.
                     </div>
+                  ) : unlockSettings.passwordSet ? (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <div>
+                          <div className="font-semibold text-slate-900">Vault password configured</div>
+                          <div className="text-sm text-muted-foreground">This method is available for document unlocks.</div>
+                        </div>
+                        <Badge variant="outline">Enabled</Badge>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => disableLocalUnlockMethod('vault_password').catch((error) => toast.error(error.message || 'Disable failed'))}
+                        >
+                          Disable vault password
+                        </Button>
+                        <Button
+                          variant="outline"
+                          onClick={() => disableLocalUnlockMethod('vault_password').catch((error) => toast.error(error.message || 'Reset failed'))}
+                        >
+                          Change password
+                        </Button>
+                      </div>
+                    </>
                   ) : (
                     <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
@@ -1724,8 +1897,7 @@ export default function DocVault() {
                       <Input type="password" value={passwordConfirmDraft} onChange={(event) => setPasswordConfirmDraft(event.target.value)} />
                     </div>
                   </div>
-                  {unlockSettings.passwordSet && <Badge variant="outline">Password configured</Badge>}
-                  <Button onClick={savePasswordMethod}>Save vault password</Button>
+                  <Button onClick={() => savePasswordMethod().catch((error) => toast.error(error.message || 'Password setup failed'))}>Save vault password</Button>
                     </>
                   )}
                 </div>
@@ -1737,6 +1909,27 @@ export default function DocVault() {
                     <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
                       Recovery-code unlock is disabled while DocVault is using system MFA.
                     </div>
+                  ) : unlockSettings.recoveryCodeCount > 0 && !replacingRecoveryCodes ? (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <div>
+                          <div className="font-semibold text-slate-900">Recovery codes configured</div>
+                          <div className="text-sm text-muted-foreground">{unlockSettings.recoveryCodeCount} codes are available for document unlocks.</div>
+                        </div>
+                        <Badge variant="outline">Enabled</Badge>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => disableLocalUnlockMethod('recovery_code').catch((error) => toast.error(error.message || 'Disable failed'))}
+                        >
+                          Disable recovery codes
+                        </Button>
+                        <Button variant="outline" onClick={() => setReplacingRecoveryCodes(true)}>
+                          Replace codes
+                        </Button>
+                      </div>
+                    </>
                   ) : (
                     <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
@@ -1750,8 +1943,7 @@ export default function DocVault() {
                       onChange={(event) => setRecoveryCodesDraft(event.target.value)}
                     />
                   </div>
-                  {unlockSettings.recoveryCodeCount > 0 && <Badge variant="outline">{unlockSettings.recoveryCodeCount} codes configured</Badge>}
-                  <Button onClick={saveRecoveryCodes}>Save recovery codes</Button>
+                  <Button onClick={() => saveRecoveryCodes().catch((error) => toast.error(error.message || 'Recovery code setup failed'))}>Save recovery codes</Button>
                     </>
                   )}
                 </div>
@@ -1763,15 +1955,24 @@ export default function DocVault() {
                     <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900">
                       Local confirmation is disabled while DocVault is using system MFA.
                     </div>
+                  ) : unlockSettings.enabled.local_confirmation ? (
+                    <>
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                        Local confirmation is enabled. Anyone with this browser session can unlock vault details by typing UNLOCK.
+                      </div>
+                      <Button
+                        variant="outline"
+                        onClick={() => disableLocalUnlockMethod('local_confirmation').catch((error) => toast.error(error.message || 'Disable failed'))}
+                      >
+                        Disable local confirmation
+                      </Button>
+                    </>
                   ) : (
                     <>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
                     Local confirmation is intended for standalone development and self-hosted fallback mode. Users type UNLOCK to reveal details.
                   </div>
-                  <Button onClick={() => {
-                    updateUnlockEnabled('local_confirmation', true);
-                    toast.success('Local confirmation enabled');
-                  }}>
+                  <Button onClick={() => enableLocalConfirmation().catch((error) => toast.error(error.message || 'Enable failed'))}>
                     Enable local confirmation
                   </Button>
                     </>
@@ -1793,27 +1994,38 @@ export default function DocVault() {
             <DialogTitle className="flex items-center gap-2"><Lock className="h-5 w-5" /> Unlock vault details</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
-            <div className="rounded-lg border bg-muted p-3 text-sm text-muted-foreground">
-              Unlock with {selectedUnlockMethod.label}. You can change the default in vault settings.
-            </div>
-            <Select value={unlockMethod} onValueChange={(value) => setUnlockMethod(value as UnlockMethod)}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {availableUnlockMethods.map((method) => (
-                  <SelectItem key={method.id} value={method.id}>{method.label}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <div className="space-y-1.5">
-              <Label>{selectedUnlockMethod.inputLabel}</Label>
-              <Input
-                type={selectedUnlockMethod.inputType || 'text'}
-                value={mfaCode}
-                onChange={(event) => setMfaCode(event.target.value)}
-                placeholder={selectedUnlockMethod.placeholder}
-              />
-            </div>
-            <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>Unlock</Button>
+            {availableUnlockMethods.length === 0 ? (
+              <>
+                <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                  No unlock method is configured. Set up MFA, a vault password, recovery codes, or explicitly enable local confirmation.
+                </div>
+                <Button className="w-full" onClick={() => setSettingsOpen(true)}>Open vault settings</Button>
+              </>
+            ) : (
+              <>
+                <div className={`rounded-lg border p-3 text-sm ${unlockMethod === 'local_confirmation' ? 'border-amber-200 bg-amber-50 text-amber-900' : 'bg-muted text-muted-foreground'}`}>
+                  Unlock with {selectedUnlockMethod.label}. {unlockMethod === 'local_confirmation' ? 'Local confirmation is enabled as a fallback.' : 'You can change the default in vault settings.'}
+                </div>
+                <Select value={unlockMethod} onValueChange={(value) => setUnlockMethod(value as UnlockMethod)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {availableUnlockMethods.map((method) => (
+                      <SelectItem key={method.id} value={method.id}>{method.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <div className="space-y-1.5">
+                  <Label>{selectedUnlockMethod.inputLabel}</Label>
+                  <Input
+                    type={selectedUnlockMethod.inputType || 'text'}
+                    value={mfaCode}
+                    onChange={(event) => setMfaCode(event.target.value)}
+                    placeholder={selectedUnlockMethod.placeholder}
+                  />
+                </div>
+                <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>Unlock</Button>
+              </>
+            )}
           </div>
         </DialogContent>
       </Dialog>
