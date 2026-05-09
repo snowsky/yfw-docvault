@@ -130,6 +130,24 @@ interface SystemMfaStatus {
   disable_script: string;
 }
 
+interface Asn1Node {
+  tag: number;
+  tagClass: number;
+  constructed: boolean;
+  contentStart: number;
+  contentEnd: number;
+  children: Asn1Node[];
+}
+
+interface CertificateInfo {
+  subject: Record<string, string>;
+  issuer: Record<string, string>;
+  serial_number: string;
+  valid_from: string;
+  valid_to: string;
+  domains: string[];
+}
+
 const emptyForm = {
   title: '',
   owner_name: '',
@@ -262,6 +280,258 @@ function cloudIntegration(entry: Pick<DocVaultEntry, 'public_metadata'>) {
     | undefined;
 }
 
+function readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function bytesToText(bytes: Uint8Array, start: number, end: number) {
+  return new TextDecoder('utf-8').decode(bytes.slice(start, end));
+}
+
+function pemToDer(content: string): Uint8Array | null {
+  const match = content.match(/-----BEGIN CERTIFICATE-----([\s\S]+?)-----END CERTIFICATE-----/);
+  if (!match) return null;
+  const binary = window.atob(match[1].replace(/\s+/g, ''));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function looksLikePem(content: string) {
+  return content.includes('-----BEGIN CERTIFICATE-----');
+}
+
+function readAsn1(bytes: Uint8Array, offset = 0, end = bytes.length): { node: Asn1Node; next: number } {
+  if (offset + 2 > end) throw new Error('Certificate data ended unexpectedly');
+  const first = bytes[offset++];
+  const tagClass = first >> 6;
+  const constructed = (first & 0x20) !== 0;
+  const tag = first & 0x1f;
+  let length = bytes[offset++];
+
+  if (length & 0x80) {
+    const count = length & 0x7f;
+    if (!count || count > 4 || offset + count > end) throw new Error('Unsupported certificate length encoding');
+    length = 0;
+    for (let index = 0; index < count; index += 1) {
+      length = (length << 8) | bytes[offset++];
+    }
+  }
+
+  const contentStart = offset;
+  const contentEnd = offset + length;
+  if (contentEnd > end) throw new Error('Certificate length exceeds available data');
+
+  const children: Asn1Node[] = [];
+  if (constructed) {
+    let childOffset = contentStart;
+    while (childOffset < contentEnd) {
+      const child = readAsn1(bytes, childOffset, contentEnd);
+      children.push(child.node);
+      childOffset = child.next;
+    }
+  }
+
+  return { node: { tag, tagClass, constructed, contentStart, contentEnd, children }, next: contentEnd };
+}
+
+function decodeOid(bytes: Uint8Array, node: Asn1Node) {
+  const values = Array.from(bytes.slice(node.contentStart, node.contentEnd));
+  if (!values.length) return '';
+  const parts = [Math.floor(values[0] / 40), values[0] % 40];
+  let value = 0;
+  for (const byte of values.slice(1)) {
+    value = (value << 7) | (byte & 0x7f);
+    if ((byte & 0x80) === 0) {
+      parts.push(value);
+      value = 0;
+    }
+  }
+  return parts.join('.');
+}
+
+function decodeAsn1String(bytes: Uint8Array, node: Asn1Node) {
+  if (node.tag === 30) {
+    const raw = bytes.slice(node.contentStart, node.contentEnd);
+    let output = '';
+    for (let index = 0; index < raw.length; index += 2) {
+      output += String.fromCharCode((raw[index] << 8) | raw[index + 1]);
+    }
+    return output;
+  }
+  return bytesToText(bytes, node.contentStart, node.contentEnd);
+}
+
+function parseAsn1Date(bytes: Uint8Array, node: Asn1Node) {
+  const value = bytesToText(bytes, node.contentStart, node.contentEnd).replace(/Z$/, '');
+  if (node.tag === 23) {
+    const year = Number(value.slice(0, 2));
+    const fullYear = year >= 50 ? 1900 + year : 2000 + year;
+    return `${fullYear}-${value.slice(2, 4)}-${value.slice(4, 6)}`;
+  }
+  if (node.tag === 24) return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+  return '';
+}
+
+function parseName(bytes: Uint8Array, node: Asn1Node) {
+  const labels: Record<string, string> = {
+    '2.5.4.3': 'common_name',
+    '2.5.4.6': 'country',
+    '2.5.4.7': 'locality',
+    '2.5.4.8': 'state',
+    '2.5.4.10': 'organization',
+    '2.5.4.11': 'organizational_unit',
+  };
+  const result: Record<string, string> = {};
+
+  node.children.forEach((setNode) => {
+    setNode.children.forEach((attribute) => {
+      const oidNode = attribute.children[0];
+      const valueNode = attribute.children[1];
+      if (!oidNode || !valueNode) return;
+      const label = labels[decodeOid(bytes, oidNode)];
+      if (!label) return;
+      const value = decodeAsn1String(bytes, valueNode);
+      result[label] = result[label] ? `${result[label]}, ${value}` : value;
+    });
+  });
+
+  return result;
+}
+
+function parseSubjectAltNames(bytes: Uint8Array, extensionsNode?: Asn1Node) {
+  if (!extensionsNode) return [];
+  const extensionSeq = extensionsNode.children[0];
+  if (!extensionSeq) return [];
+
+  for (const extension of extensionSeq.children) {
+    const oid = extension.children[0] ? decodeOid(bytes, extension.children[0]) : '';
+    if (oid !== '2.5.29.17') continue;
+    const octetNode = extension.children.find((child) => child.tagClass === 0 && child.tag === 4);
+    if (!octetNode) return [];
+    const namesSeq = readAsn1(bytes, octetNode.contentStart, octetNode.contentEnd).node;
+    return namesSeq.children
+      .filter((name) => name.tagClass === 2 && name.tag === 2)
+      .map((name) => bytesToText(bytes, name.contentStart, name.contentEnd));
+  }
+
+  return [];
+}
+
+function octetStringContent(bytes: Uint8Array, node: Asn1Node) {
+  const octet = node.tagClass === 0 && node.tag === 4
+    ? node
+    : node.children.find((child) => child.tagClass === 0 && child.tag === 4);
+  if (!octet) return null;
+  return bytes.slice(octet.contentStart, octet.contentEnd);
+}
+
+function extractPfxContentInfoData(bytes: Uint8Array, contentInfo: Asn1Node) {
+  const contentType = contentInfo.children[0] ? decodeOid(bytes, contentInfo.children[0]) : '';
+  if (contentType === '1.2.840.113549.1.7.6') {
+    throw new Error('Password-encrypted PFX files are not supported yet');
+  }
+  if (contentType !== '1.2.840.113549.1.7.1') return null;
+
+  const explicitContent = contentInfo.children.find((child) => child.tagClass === 2 && child.tag === 0);
+  return explicitContent ? octetStringContent(bytes, explicitContent) : null;
+}
+
+function parseCertificatesFromPfx(bytes: Uint8Array) {
+  const pfx = readAsn1(bytes).node;
+  const authSafe = pfx.children[1];
+  if (!authSafe) throw new Error('PFX file is missing authenticated safe content');
+
+  const authSafeBytes = extractPfxContentInfoData(bytes, authSafe);
+  if (!authSafeBytes) throw new Error('PFX file does not contain readable certificate data');
+
+  const certificates: CertificateInfo[] = [];
+  const authenticatedSafe = readAsn1(authSafeBytes).node;
+
+  authenticatedSafe.children.forEach((contentInfo) => {
+    const safeContentsBytes = extractPfxContentInfoData(authSafeBytes, contentInfo);
+    if (!safeContentsBytes) return;
+    const safeContents = readAsn1(safeContentsBytes).node;
+
+    safeContents.children.forEach((safeBag) => {
+      const bagId = safeBag.children[0] ? decodeOid(safeContentsBytes, safeBag.children[0]) : '';
+      if (bagId !== '1.2.840.113549.1.12.10.1.3') return;
+
+      const bagValue = safeBag.children.find((child) => child.tagClass === 2 && child.tag === 0);
+      const certBag = bagValue?.children[0];
+      if (!certBag) return;
+
+      const certBagId = certBag.children[0] ? decodeOid(safeContentsBytes, certBag.children[0]) : '';
+      if (certBagId !== '1.2.840.113549.1.9.22.1') return;
+
+      const certValue = certBag.children.find((child) => child.tagClass === 2 && child.tag === 0);
+      const certDer = certValue ? octetStringContent(safeContentsBytes, certValue) : null;
+      if (!certDer) return;
+
+      certificates.push(parseCertificate(certDer));
+    });
+  });
+
+  if (!certificates.length) throw new Error('No readable certificate was found in the PFX file');
+  return certificates;
+}
+
+function parseCertificateFile(bytes: Uint8Array, asText: string) {
+  if (looksLikePem(asText)) return parseCertificate(pemToDer(asText)!);
+  if (asText.includes('-----BEGIN')) {
+    throw new Error('Only PEM certificates with BEGIN CERTIFICATE blocks are supported');
+  }
+
+  const root = readAsn1(bytes).node;
+  const pfxContentType = root.children[1]?.children[0] ? decodeOid(bytes, root.children[1].children[0]) : '';
+  if (pfxContentType === '1.2.840.113549.1.7.1' || pfxContentType === '1.2.840.113549.1.7.6') {
+    const candidates = parseCertificatesFromPfx(bytes);
+    return candidates.find((candidate) => candidate.domains.length > 0) || candidates[0];
+  }
+  return parseCertificate(bytes);
+}
+
+function parseCertificate(bytes: Uint8Array): CertificateInfo {
+  const certificate = readAsn1(bytes).node;
+  const tbsCertificate = certificate.children[0];
+  if (!tbsCertificate) throw new Error('Certificate structure is missing tbsCertificate');
+
+  let index = tbsCertificate.children[0]?.tagClass === 2 && tbsCertificate.children[0]?.tag === 0 ? 1 : 0;
+  const serialNode = tbsCertificate.children[index++];
+  index += 1;
+  const issuerNode = tbsCertificate.children[index++];
+  const validityNode = tbsCertificate.children[index++];
+  const subjectNode = tbsCertificate.children[index++];
+  const extensionsNode = tbsCertificate.children.find((child) => child.tagClass === 2 && child.tag === 3);
+  if (!serialNode || !issuerNode || !validityNode || !subjectNode) throw new Error('Certificate is missing required identity fields');
+
+  const serial = Array.from(bytes.slice(serialNode.contentStart, serialNode.contentEnd))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join(':')
+    .replace(/^00:/, '');
+  const subject = parseName(bytes, subjectNode);
+  const issuer = parseName(bytes, issuerNode);
+  const validFromNode = validityNode.children[0];
+  const validToNode = validityNode.children[1];
+  if (!validFromNode || !validToNode) throw new Error('Certificate validity dates are missing');
+  const domains = Array.from(new Set([
+    ...parseSubjectAltNames(bytes, extensionsNode),
+    ...(subject.common_name ? [subject.common_name] : []),
+  ]));
+
+  return {
+    subject,
+    issuer,
+    serial_number: serial,
+    valid_from: parseAsn1Date(bytes, validFromNode),
+    valid_to: parseAsn1Date(bytes, validToNode),
+    domains,
+  };
+}
+
 function CardVisual({ form }: { form: typeof emptyForm }) {
   const number = form.card_number.replace(/\D/g, '');
   const last4 = number.slice(-4).padStart(4, '•');
@@ -315,6 +585,7 @@ export default function DocVault() {
   const [mfaSetup, setMfaSetup] = React.useState<MfaSetup | null>(null);
   const [mfaVerifyCode, setMfaVerifyCode] = React.useState('');
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
+  const [certificateInfo, setCertificateInfo] = React.useState<CertificateInfo | null>(null);
   const [historyEntry, setHistoryEntry] = React.useState<DocVaultEntry | null>(null);
   const [versions, setVersions] = React.useState<AttachmentVersion[]>([]);
   const [signatureEntry, setSignatureEntry] = React.useState<DocVaultEntry | null>(null);
@@ -415,6 +686,28 @@ export default function DocVault() {
   async function handleFile(file: File) {
     const dataUrl = await readFileAsDataUrl(file);
     setSelectedFile({ name: file.name, type: file.type || 'application/octet-stream', size: file.size, dataUrl });
+  }
+
+  async function handleCertificateUpload(file: File) {
+    const buffer = await readFileAsArrayBuffer(file);
+    const fileBytes = new Uint8Array(buffer);
+    const asText = bytesToText(fileBytes, 0, fileBytes.length);
+    const parsed = parseCertificateFile(fileBytes, asText);
+    const dataUrl = await readFileAsDataUrl(file);
+    const primaryDomain = parsed.domains[0] || '';
+    const issuer = parsed.issuer.organization || parsed.issuer.common_name || '';
+
+    setCertificateInfo(parsed);
+    setSelectedFile({ name: file.name, type: file.type || 'application/x-x509-ca-cert', size: file.size, dataUrl });
+    setForm((prev) => ({
+      ...prev,
+      title: prev.title || primaryDomain || file.name,
+      domain: prev.domain || primaryDomain,
+      issuer: prev.issuer || issuer,
+      issue_date: prev.issue_date || parsed.valid_from,
+      expiry_date: prev.expiry_date || parsed.valid_to,
+    }));
+    toast.success('Certificate parsed');
   }
 
   async function loadHistory(entry: DocVaultEntry) {
@@ -559,7 +852,15 @@ export default function DocVault() {
         expiryDate = `20${year}-${month}-01`;
       }
     }
-    if (activeTab === 'ssl_certificate') metadata.domain = form.domain;
+    if (activeTab === 'ssl_certificate') {
+      metadata.domain = form.domain;
+      if (certificateInfo) {
+        metadata.certificate = certificateInfo;
+        metadata.subject = certificateInfo.subject;
+        metadata.serial_number = certificateInfo.serial_number;
+        metadata.subject_alt_names = certificateInfo.domains;
+      }
+    }
     if (activeTab === 'id_card') metadata.card_type = form.card_type;
     if (activeTab === 'document') {
       if (form.retention_years) {
@@ -616,6 +917,7 @@ export default function DocVault() {
     });
     setForm(emptyForm);
     setSelectedFile(null);
+    setCertificateInfo(null);
     setWizardOpen(false);
     setWizardStep(1);
     await loadEntries();
@@ -685,6 +987,7 @@ export default function DocVault() {
     setActiveTab(category);
     setForm(emptyForm);
     setSelectedFile(null);
+    setCertificateInfo(null);
     setScanDraft(null);
     setWizardStep(1);
     setWizardOpen(true);
@@ -698,6 +1001,7 @@ export default function DocVault() {
     setWizardStep(1);
     setForm(emptyForm);
     setSelectedFile(null);
+    setCertificateInfo(null);
     setScanDraft(null);
   }
 
@@ -949,6 +1253,7 @@ export default function DocVault() {
                         setActiveTab(tab.id);
                         setForm(emptyForm);
                         setSelectedFile(null);
+                        setCertificateInfo(null);
                       }}
                     >
                       <span className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-100">
@@ -1017,6 +1322,34 @@ export default function DocVault() {
 
                 {activeTab === 'ssl_certificate' && (
                   <>
+                    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4">
+                      <Label className="mb-2 flex items-center gap-2">
+                        <Upload className="h-4 w-4" />
+                        Upload SSL certificate
+                      </Label>
+                      <Input
+                        type="file"
+                        accept=".pem,.crt,.cer,.der,.pfx,.p12,application/x-x509-ca-cert,application/pkix-cert,application/x-pkcs12"
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          if (!file) return;
+                          handleCertificateUpload(file).catch((error) => toast.error(error.message || 'Certificate parse failed'));
+                        }}
+                      />
+                      {selectedFile && <div className="mt-2 text-xs text-muted-foreground">{selectedFile.name} · {fileSize(selectedFile.size)}</div>}
+                      {certificateInfo && (
+                        <div className="mt-3 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
+                          <div className="rounded-md border border-slate-200 bg-white p-2">
+                            <div className="font-semibold text-slate-900">Subject</div>
+                            <div className="truncate">{certificateInfo.subject.common_name || certificateInfo.domains[0] || 'Unknown subject'}</div>
+                          </div>
+                          <div className="rounded-md border border-slate-200 bg-white p-2">
+                            <div className="font-semibold text-slate-900">Serial</div>
+                            <div className="truncate font-mono">{certificateInfo.serial_number || 'Unavailable'}</div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                     <div className="space-y-1.5">
                       <Label>Domain</Label>
                       <Input value={form.domain} onChange={(e) => setForm({ ...form, domain: e.target.value, title: e.target.value || form.title })} />
