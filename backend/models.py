@@ -84,3 +84,16 @@ class DocVaultSignature(Base):
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     signed_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class DocVaultMFAEnrollment(Base):
+    __tablename__ = "docvault_mfa_enrollments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    factor_id = Column(String, nullable=False, index=True)
+    label = Column(EncryptedColumn(), nullable=True)
+    secret = Column(EncryptedColumn(), nullable=False)
+    is_verified = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    verified_at = Column(DateTime(timezone=True), nullable=True)

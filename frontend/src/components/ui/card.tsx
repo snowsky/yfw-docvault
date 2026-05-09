@@ -1,8 +1,12 @@
+import React from 'react';
+
 import { cx, type PrimitiveProps } from './primitives';
 
-export function Card({ className, ...props }: PrimitiveProps<'div'>) {
-  return <div className={cx('dv-card', className)} {...props} />;
-}
+export const Card = React.forwardRef<HTMLDivElement, PrimitiveProps<'div'>>(
+  ({ className, ...props }, ref) => <div ref={ref} className={cx('dv-card', className)} {...props} />,
+);
+
+Card.displayName = 'Card';
 
 export function CardHeader({ className, ...props }: PrimitiveProps<'div'>) {
   return <div className={cx('dv-card-header', className)} {...props} />;
