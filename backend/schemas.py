@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 DocVaultCategory = Literal["credit_card", "ssl_certificate", "id_card", "document", "secret"]
+DocVaultCloudProvider = Literal["google_drive", "onedrive"]
 
 
 class DocVaultEntryBase(BaseModel):
@@ -69,6 +70,34 @@ class DocVaultUnlockRequest(BaseModel):
     window: int = Field(default=1, ge=0)
 
 
+class DocVaultMFASetupRequest(BaseModel):
+    factor_id: Literal["google_auth", "ms_auth"]
+    label: str | None = Field(default=None, max_length=160)
+
+
+class DocVaultMFASetupResponse(BaseModel):
+    factor_id: str
+    label: str | None = None
+    secret: str
+    otpauth_uri: str
+    qr_data_url: str | None = None
+    is_verified: bool = False
+
+
+class DocVaultMFAVerifyRequest(BaseModel):
+    factor_id: Literal["google_auth", "ms_auth"]
+    code: str = Field(min_length=1)
+    window: int = Field(default=1, ge=0)
+
+
+class DocVaultMFAEnrollmentResponse(BaseModel):
+    factor_id: str
+    label: str | None = None
+    is_verified: bool
+    created_at: datetime
+    verified_at: datetime | None = None
+
+
 class DocVaultScanRequest(BaseModel):
     category: Literal["credit_card", "id_card"]
     file_name: str | None = None
@@ -101,6 +130,15 @@ class DocVaultAttachmentVersionResponse(DocVaultAttachmentVersionCreate):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DocVaultCloudLinkRequest(BaseModel):
+    provider: DocVaultCloudProvider
+    file_url: str = Field(min_length=1, max_length=2048)
+    file_id: str | None = Field(default=None, max_length=255)
+    file_name: str | None = Field(default=None, max_length=255)
+    file_mime_type: str | None = None
+    change_note: str | None = None
 
 
 class DocVaultSignatureCreate(BaseModel):

@@ -3,18 +3,22 @@ import {
   AlertCircle,
   Archive,
   BadgeCheck,
+  Cloud,
   Copy,
   CreditCard,
+  ExternalLink,
   FileKey2,
   FileText,
   History,
   IdCard,
   KeyRound,
+  Link2,
   Lock,
   PackageCheck,
   PenLine,
   Plus,
   Search,
+  Settings,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -29,12 +33,21 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { apiRequest } from '@/lib/api';
 
 type Category = 'credit_card' | 'ssl_certificate' | 'id_card' | 'document' | 'secret';
 type ExpiryStatus = 'expired' | 'expiring_soon' | 'valid';
+type DocumentSource = 'local' | 'google_drive' | 'onedrive';
+type UnlockMethod = 'mfa_google' | 'mfa_microsoft' | 'vault_password' | 'recovery_code' | 'local_confirmation';
+
+interface UnlockSettings {
+  enabled: Record<UnlockMethod, boolean>;
+  googleAccount: string;
+  microsoftAccount: string;
+  passwordSet: boolean;
+  recoveryCodeCount: number;
+}
 
 interface DocVaultEntry {
   id: number;
@@ -87,6 +100,23 @@ interface SignatureRecord {
   signed_at: string;
 }
 
+interface MfaEnrollment {
+  factor_id: string;
+  label?: string | null;
+  is_verified: boolean;
+  created_at: string;
+  verified_at?: string | null;
+}
+
+interface MfaSetup {
+  factor_id: string;
+  label?: string | null;
+  secret: string;
+  otpauth_uri: string;
+  qr_data_url?: string | null;
+  is_verified: boolean;
+}
+
 const emptyForm = {
   title: '',
   owner_name: '',
@@ -105,14 +135,18 @@ const emptyForm = {
   password: '',
   private_key: '',
   retention_years: '',
+  document_source: 'local' as DocumentSource,
+  cloud_url: '',
+  cloud_file_id: '',
+  cloud_file_name: '',
 };
 
-const tabConfig: Array<{ id: Category | 'all'; label: string; icon: React.ElementType }> = [
-  { id: 'credit_card', label: 'Credit Cards', icon: CreditCard },
-  { id: 'ssl_certificate', label: 'SSL Certificates', icon: ShieldCheck },
-  { id: 'id_card', label: 'ID & Health Cards', icon: IdCard },
-  { id: 'document', label: 'Documents', icon: FileText },
-  { id: 'secret', label: 'Passwords & Keys', icon: FileKey2 },
+const tabConfig: Array<{ id: Category; label: string; singularLabel: string; icon: React.ElementType }> = [
+  { id: 'credit_card', label: 'Credit Cards', singularLabel: 'Credit Card', icon: CreditCard },
+  { id: 'ssl_certificate', label: 'SSL Certificates', singularLabel: 'SSL Certificate', icon: ShieldCheck },
+  { id: 'id_card', label: 'ID & Health Cards', singularLabel: 'ID or Health Card', icon: IdCard },
+  { id: 'document', label: 'Documents', singularLabel: 'Document', icon: FileText },
+  { id: 'secret', label: 'Passwords & Keys', singularLabel: 'Password or Key', icon: FileKey2 },
 ];
 
 const networkStyles: Record<string, string> = {
@@ -122,6 +156,43 @@ const networkStyles: Record<string, string> = {
   Discover: 'from-orange-600 to-amber-400',
   UnionPay: 'from-red-700 to-rose-500',
 };
+
+const unlockMethods: Array<{ id: UnlockMethod; label: string; factorId: string; inputLabel: string; placeholder: string; inputType?: string }> = [
+  { id: 'mfa_google', label: 'Google Authenticator', factorId: 'google_auth', inputLabel: 'Authenticator code', placeholder: '6-digit code' },
+  { id: 'mfa_microsoft', label: 'Microsoft Authenticator', factorId: 'ms_auth', inputLabel: 'Authenticator code', placeholder: '6-digit code' },
+  { id: 'vault_password', label: 'Vault password', factorId: 'vault_password', inputLabel: 'Vault password', placeholder: 'Enter vault password', inputType: 'password' },
+  { id: 'recovery_code', label: 'Recovery code', factorId: 'recovery_code', inputLabel: 'Recovery code', placeholder: 'Enter recovery code' },
+  { id: 'local_confirmation', label: 'Local confirmation', factorId: 'local_fallback', inputLabel: 'Confirmation', placeholder: 'Type UNLOCK' },
+];
+
+const defaultUnlockSettings: UnlockSettings = {
+  enabled: {
+    mfa_google: true,
+    mfa_microsoft: false,
+    vault_password: false,
+    recovery_code: false,
+    local_confirmation: true,
+  },
+  googleAccount: '',
+  microsoftAccount: '',
+  passwordSet: false,
+  recoveryCodeCount: 0,
+};
+
+function loadUnlockSettings(): UnlockSettings {
+  try {
+    const saved = window.localStorage.getItem('docvault.unlockSettings');
+    if (!saved) return defaultUnlockSettings;
+    const parsed = JSON.parse(saved);
+    return {
+      ...defaultUnlockSettings,
+      ...parsed,
+      enabled: { ...defaultUnlockSettings.enabled, ...(parsed.enabled || {}) },
+    };
+  } catch {
+    return defaultUnlockSettings;
+  }
+}
 
 function expiryPreview(category: Category, expiry: string): { status: ExpiryStatus; days: number | null } {
   if (!expiry) return { status: 'valid', days: null };
@@ -166,6 +237,18 @@ function fileSize(bytes?: number | null) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function cloudProviderLabel(provider?: string | null) {
+  if (provider === 'google_drive') return 'Google Drive';
+  if (provider === 'onedrive') return 'OneDrive';
+  return 'Cloud';
+}
+
+function cloudIntegration(entry: Pick<DocVaultEntry, 'public_metadata'>) {
+  return entry.public_metadata?.cloud_integration as
+    | { provider?: DocumentSource; provider_label?: string; file_url?: string; file_id?: string; file_name?: string }
+    | undefined;
+}
+
 function CardVisual({ form }: { form: typeof emptyForm }) {
   const number = form.card_number.replace(/\D/g, '');
   const last4 = number.slice(-4).padStart(4, '•');
@@ -195,12 +278,28 @@ export default function DocVault() {
   const [activeTab, setActiveTab] = React.useState<Category>('credit_card');
   const [query, setQuery] = React.useState('');
   const [tagFilter, setTagFilter] = React.useState('');
+  const [categoryFilter, setCategoryFilter] = React.useState<Category | 'all'>('all');
+  const [page, setPage] = React.useState(1);
   const [form, setForm] = React.useState(emptyForm);
+  const [wizardOpen, setWizardOpen] = React.useState(false);
+  const [wizardStep, setWizardStep] = React.useState(1);
   const [scanDraft, setScanDraft] = React.useState<Record<string, any> | null>(null);
   const [unlocking, setUnlocking] = React.useState<DocVaultEntry | null>(null);
   const [unlocked, setUnlocked] = React.useState<DocVaultEntry | null>(null);
   const [mfaCode, setMfaCode] = React.useState('');
-  const [mfaFactor, setMfaFactor] = React.useState('google_auth');
+  const [unlockMethod, setUnlockMethod] = React.useState<UnlockMethod>(() => {
+    const saved = window.localStorage.getItem('docvault.unlockMethod') as UnlockMethod | null;
+    return unlockMethods.some((method) => method.id === saved) ? saved! : 'mfa_google';
+  });
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [unlockSettings, setUnlockSettings] = React.useState<UnlockSettings>(loadUnlockSettings);
+  const [settingsMethod, setSettingsMethod] = React.useState<UnlockMethod>('mfa_google');
+  const [passwordDraft, setPasswordDraft] = React.useState('');
+  const [passwordConfirmDraft, setPasswordConfirmDraft] = React.useState('');
+  const [recoveryCodesDraft, setRecoveryCodesDraft] = React.useState('');
+  const [mfaEnrollments, setMfaEnrollments] = React.useState<MfaEnrollment[]>([]);
+  const [mfaSetup, setMfaSetup] = React.useState<MfaSetup | null>(null);
+  const [mfaVerifyCode, setMfaVerifyCode] = React.useState('');
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
   const [historyEntry, setHistoryEntry] = React.useState<DocVaultEntry | null>(null);
   const [versions, setVersions] = React.useState<AttachmentVersion[]>([]);
@@ -208,6 +307,7 @@ export default function DocVault() {
   const [signatures, setSignatures] = React.useState<SignatureRecord[]>([]);
   const [signatureForm, setSignatureForm] = React.useState({ signer_name: '', signer_email: '', provider: 'manual', signature_reference: '' });
   const [auditPackage, setAuditPackage] = React.useState<Record<string, any> | null>(null);
+  const titleInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const loadEntries = React.useCallback(async () => {
     const data = await apiRequest<DocVaultEntry[]>('/docvault');
@@ -218,19 +318,43 @@ export default function DocVault() {
     loadEntries().catch((error) => toast.error(error.message || 'Failed to load DocVault'));
   }, [loadEntries]);
 
-  const current = entries.filter((entry) => entry.category === activeTab);
-  const filtered = current.filter((entry) => {
-    const textMatch = !query || `${entry.title} ${entry.file_name || ''}`.toLowerCase().includes(query.toLowerCase());
+  const filtered = entries.filter((entry) => {
+    const text = `${entry.title} ${entry.file_name || ''} ${entry.owner_name || ''} ${entry.issuer || ''} ${entry.tags.join(' ')}`.toLowerCase();
+    const textMatch = !query || text.includes(query.toLowerCase());
     const tagMatch = !tagFilter || entry.tags.includes(tagFilter);
-    return textMatch && tagMatch;
+    const categoryMatch = categoryFilter === 'all' || entry.category === categoryFilter;
+    return textMatch && tagMatch && categoryMatch;
   });
+  const pageSize = 8;
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(page, pageCount);
+  const paginated = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
   const alertCount = entries.filter((entry) => entry.alerting).length;
   const allTags = Array.from(new Set(entries.flatMap((entry) => entry.tags))).sort();
   const summary = {
-    expired: current.filter((entry) => entry.expiry_status === 'expired').length,
-    expiring: current.filter((entry) => entry.expiry_status === 'expiring_soon').length,
-    valid: current.filter((entry) => entry.expiry_status === 'valid').length,
+    expired: entries.filter((entry) => entry.expiry_status === 'expired').length,
+    expiring: entries.filter((entry) => entry.expiry_status === 'expiring_soon').length,
+    valid: entries.filter((entry) => entry.expiry_status === 'valid').length,
   };
+  const activeTabConfig = tabConfig.find((tab) => tab.id === activeTab) || tabConfig[0];
+  const selectedUnlockMethod = unlockMethods.find((method) => method.id === unlockMethod) || unlockMethods[0];
+
+  React.useEffect(() => {
+    setPage(1);
+  }, [query, tagFilter, categoryFilter]);
+
+  React.useEffect(() => {
+    window.localStorage.setItem('docvault.unlockMethod', unlockMethod);
+  }, [unlockMethod]);
+
+  React.useEffect(() => {
+    window.localStorage.setItem('docvault.unlockSettings', JSON.stringify(unlockSettings));
+  }, [unlockSettings]);
+
+  React.useEffect(() => {
+    if (!settingsOpen) return;
+    loadMfaEnrollments().catch((error) => toast.error(error.message || 'Failed to load MFA enrollment'));
+  }, [settingsOpen]);
 
   async function handleScan(file: File) {
     const dataUrl = await readFileAsDataUrl(file);
@@ -321,6 +445,51 @@ export default function DocVault() {
     toast.success('Audit package generated');
   }
 
+  async function loadMfaEnrollments() {
+    const data = await apiRequest<MfaEnrollment[]>('/docvault/mfa/enrollments');
+    setMfaEnrollments(data);
+    setUnlockSettings((current) => {
+      const next = { ...current, enabled: { ...current.enabled } };
+      data.forEach((enrollment) => {
+        if (enrollment.factor_id === 'google_auth' && enrollment.is_verified) {
+          next.enabled.mfa_google = true;
+          next.googleAccount = enrollment.label || next.googleAccount;
+        }
+        if (enrollment.factor_id === 'ms_auth' && enrollment.is_verified) {
+          next.enabled.mfa_microsoft = true;
+          next.microsoftAccount = enrollment.label || next.microsoftAccount;
+        }
+      });
+      return next;
+    });
+  }
+
+  async function startMfaEnrollment(method: UnlockMethod) {
+    const factorId = unlockMethods.find((item) => item.id === method)?.factorId;
+    if (factorId !== 'google_auth' && factorId !== 'ms_auth') return;
+    const label = method === 'mfa_google' ? unlockSettings.googleAccount : unlockSettings.microsoftAccount;
+    const setup = await apiRequest<MfaSetup>('/docvault/mfa/enrollments/setup', {
+      method: 'POST',
+      body: JSON.stringify({ factor_id: factorId, label: label || null }),
+    });
+    setMfaSetup(setup);
+    setMfaVerifyCode('');
+  }
+
+  async function verifyMfaEnrollment() {
+    if (!mfaSetup) return;
+    const enrollment = await apiRequest<MfaEnrollment>('/docvault/mfa/enrollments/verify', {
+      method: 'POST',
+      body: JSON.stringify({ factor_id: mfaSetup.factor_id, code: mfaVerifyCode }),
+    });
+    await loadMfaEnrollments();
+    const method: UnlockMethod = enrollment.factor_id === 'google_auth' ? 'mfa_google' : 'mfa_microsoft';
+    updateUnlockEnabled(method, true);
+    setMfaSetup(null);
+    setMfaVerifyCode('');
+    toast.success('MFA enrollment verified');
+  }
+
   async function saveEntry() {
     const metadata: Record<string, any> = {};
     const sensitive: Record<string, any> = {};
@@ -343,9 +512,24 @@ export default function DocVault() {
     }
     if (activeTab === 'ssl_certificate') metadata.domain = form.domain;
     if (activeTab === 'id_card') metadata.card_type = form.card_type;
-    if (activeTab === 'document' && form.retention_years) {
-      metadata.retention_years = Number(form.retention_years);
-      metadata.retention_start_date = new Date().toISOString().slice(0, 10);
+    if (activeTab === 'document') {
+      if (form.retention_years) {
+        metadata.retention_years = Number(form.retention_years);
+        metadata.retention_start_date = new Date().toISOString().slice(0, 10);
+      }
+      if (form.document_source !== 'local') {
+        if (!form.cloud_url.trim()) {
+          toast.error(`Add a ${cloudProviderLabel(form.document_source)} share link`);
+          return;
+        }
+        metadata.cloud_integration = {
+          provider: form.document_source,
+          file_url: form.cloud_url.trim(),
+          file_id: form.cloud_file_id.trim() || null,
+          file_name: form.cloud_file_name.trim() || title || null,
+        };
+        title = title || form.cloud_file_name.trim() || cloudProviderLabel(form.document_source);
+      }
     }
     if (activeTab === 'secret') {
       sensitive.password = form.password;
@@ -371,14 +555,20 @@ export default function DocVault() {
         notes: form.notes || null,
         tags: form.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
         thumbnail_data_url: activeTab === 'id_card' ? selectedFile?.dataUrl : null,
-        file_name: selectedFile?.name || null,
-        file_mime_type: selectedFile?.type || null,
-        file_size: selectedFile?.size || null,
-        file_data_url: activeTab === 'document' ? selectedFile?.dataUrl : null,
+        file_name: activeTab === 'document' && form.document_source !== 'local'
+          ? form.cloud_file_name || title
+          : selectedFile?.name || null,
+        file_mime_type: activeTab === 'document' && form.document_source !== 'local'
+          ? 'application/vnd.docvault.cloud-link'
+          : selectedFile?.type || null,
+        file_size: activeTab === 'document' && form.document_source !== 'local' ? null : selectedFile?.size || null,
+        file_data_url: activeTab === 'document' && form.document_source === 'local' ? selectedFile?.dataUrl : null,
       }),
     });
     setForm(emptyForm);
     setSelectedFile(null);
+    setWizardOpen(false);
+    setWizardStep(1);
     await loadEntries();
     toast.success('Saved to DocVault');
   }
@@ -391,306 +581,562 @@ export default function DocVault() {
 
   async function unlockEntry() {
     if (!unlocking) return;
+    if (!unlockSettings.enabled[unlockMethod]) {
+      toast.error('Enable this unlock method in settings first');
+      return;
+    }
     const data = await apiRequest<DocVaultEntry>(`/docvault/${unlocking.id}/unlock`, {
       method: 'POST',
-      body: JSON.stringify({ factor_id: mfaFactor, user_input: mfaCode }),
+      body: JSON.stringify({ factor_id: selectedUnlockMethod.factorId, user_input: mfaCode }),
     });
     setUnlocked(data);
     setUnlocking(null);
     setMfaCode('');
   }
 
+  function updateUnlockEnabled(method: UnlockMethod, enabled: boolean) {
+    setUnlockSettings((current) => ({ ...current, enabled: { ...current.enabled, [method]: enabled } }));
+  }
+
+  function savePasswordMethod() {
+    if (passwordDraft.length < 8) {
+      toast.error('Use at least 8 characters for the vault password');
+      return;
+    }
+    if (passwordDraft !== passwordConfirmDraft) {
+      toast.error('Vault passwords do not match');
+      return;
+    }
+    setUnlockSettings((current) => ({
+      ...current,
+      passwordSet: true,
+      enabled: { ...current.enabled, vault_password: true },
+    }));
+    setPasswordDraft('');
+    setPasswordConfirmDraft('');
+    toast.success('Vault password method set up');
+  }
+
+  function saveRecoveryCodes() {
+    const codes = recoveryCodesDraft.split(/\s+/).map((code) => code.trim()).filter(Boolean);
+    if (codes.length === 0) {
+      toast.error('Add at least one recovery code');
+      return;
+    }
+    setUnlockSettings((current) => ({
+      ...current,
+      recoveryCodeCount: codes.length,
+      enabled: { ...current.enabled, recovery_code: true },
+    }));
+    setRecoveryCodesDraft('');
+    toast.success('Recovery code method set up');
+  }
+
+  function startNewEntry(category: Category = activeTab) {
+    setActiveTab(category);
+    setForm(emptyForm);
+    setSelectedFile(null);
+    setScanDraft(null);
+    setWizardStep(1);
+    setWizardOpen(true);
+    window.requestAnimationFrame(() => {
+      titleInputRef.current?.focus();
+    });
+  }
+
+  function closeWizard() {
+    setWizardOpen(false);
+    setWizardStep(1);
+    setForm(emptyForm);
+    setSelectedFile(null);
+    setScanDraft(null);
+  }
+
   const preview = expiryPreview(activeTab, form.expiry_date);
 
   return (
-    <div className="min-h-screen bg-background p-6">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">DocVault</h1>
-            <p className="text-sm text-muted-foreground">Document and expiry manager with MFA-gated sensitive details.</p>
+    <div className="min-h-screen bg-background px-4 py-6 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-7xl space-y-5">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-xs font-semibold uppercase text-blue-700">
+              <Archive className="h-4 w-4" />
+              Secure records
+            </div>
+            <h1 className="text-3xl font-bold tracking-tight text-slate-950">DocVault</h1>
+            <p className="max-w-2xl text-sm text-muted-foreground">Manage credentials, IDs, certificates, and documents with expiry tracking and MFA-gated details.</p>
           </div>
-          <Badge variant={alertCount ? 'destructive' : 'outline'} className="gap-2 px-3 py-1.5">
-            <AlertCircle className="h-4 w-4" />
-            {alertCount} expiry alerts
-          </Badge>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={alertCount ? 'destructive' : 'outline'} className="gap-2 px-3 py-1.5">
+              <AlertCircle className="h-4 w-4" />
+              {alertCount} expiry alerts
+            </Badge>
+            <Button variant="outline" onClick={() => runRetention().catch((error) => toast.error(error.message || 'Retention run failed'))}>
+              <Archive className="h-4 w-4" />
+              Run retention
+            </Button>
+            <Button variant="outline" onClick={() => buildAuditPackage().catch((error) => toast.error(error.message || 'Audit package failed'))}>
+              <PackageCheck className="h-4 w-4" />
+              Audit package
+            </Button>
+            <Button variant="outline" onClick={() => setSettingsOpen(true)}>
+              <Settings className="h-4 w-4" />
+              Settings
+            </Button>
+          </div>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => runRetention().catch((error) => toast.error(error.message || 'Retention run failed'))}>
-            <Archive className="h-4 w-4" />
-            Run retention
-          </Button>
-          <Button variant="outline" onClick={() => buildAuditPackage().catch((error) => toast.error(error.message || 'Audit package failed'))}>
-            <PackageCheck className="h-4 w-4" />
-            Audit package
-          </Button>
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-lg border border-slate-200 bg-white p-4 text-slate-900 shadow-sm">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">Total items</div>
+              <Archive className="h-4 w-4 text-blue-700" />
+            </div>
+            <div className="mt-2 text-3xl font-bold">{entries.length}</div>
+          </div>
+          <div className="rounded-lg border border-red-200 bg-white p-4 text-red-800 shadow-sm">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase text-red-600">Expired</div>
+              <AlertCircle className="h-4 w-4" />
+            </div>
+            <div className="mt-2 text-3xl font-bold">{summary.expired}</div>
+          </div>
+          <div className="rounded-lg border border-yellow-200 bg-white p-4 text-yellow-900 shadow-sm">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase text-yellow-700">Expiring Soon</div>
+              <History className="h-4 w-4" />
+            </div>
+            <div className="mt-2 text-3xl font-bold">{summary.expiring}</div>
+          </div>
+          <div className="rounded-lg border border-emerald-200 bg-white p-4 text-emerald-800 shadow-sm">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase text-emerald-700">Valid</div>
+              <ShieldCheck className="h-4 w-4" />
+            </div>
+            <div className="mt-2 text-3xl font-bold">{summary.valid}</div>
+          </div>
         </div>
 
-        <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as Category)}>
-          <TabsList className="grid h-auto w-full grid-cols-2 gap-1 md:grid-cols-5">
-            {tabConfig.map((tab) => {
-              const Icon = tab.icon;
-              return (
-                <TabsTrigger key={tab.id} value={tab.id} className="gap-2">
-                  <Icon className="h-4 w-4" />
-                  {tab.label}
-                </TabsTrigger>
-              );
-            })}
-          </TabsList>
+        <Card>
+          <CardHeader>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <CardTitle className="text-lg">All items</CardTitle>
+                <p className="mt-1 text-sm text-muted-foreground">{filtered.length} shown of {entries.length} records</p>
+              </div>
+              <Button onClick={() => startNewEntry(activeTab)}>
+                <Plus className="h-4 w-4" />
+                Add Item
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 md:grid-cols-[minmax(220px,1fr)_200px_200px]">
+              <div className="relative">
+                <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Input className="pl-9" placeholder="Search titles, files, owners, issuers, or tags" value={query} onChange={(e) => setQuery(e.target.value)} />
+              </div>
+              <Select value={categoryFilter} onValueChange={(value) => setCategoryFilter(value as Category | 'all')}>
+                <SelectTrigger><SelectValue placeholder="Filter by type" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All types</SelectItem>
+                  {tabConfig.map((tab) => <SelectItem key={tab.id} value={tab.id}>{tab.singularLabel}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <Select value={tagFilter || 'all'} onValueChange={(value) => setTagFilter(value === 'all' ? '' : value)}>
+                <SelectTrigger><SelectValue placeholder="Filter by tag" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All tags</SelectItem>
+                  {allTags.map((tag) => <SelectItem key={tag} value={tag}>{tag}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
 
-          {tabConfig.map((tab) => (
-            <TabsContent key={tab.id} value={tab.id} className="space-y-5">
-              <div className="grid gap-3 md:grid-cols-3">
-                <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-red-800">
-                  <div className="text-xs font-medium uppercase">Expired</div>
-                  <div className="text-2xl font-bold">{summary.expired}</div>
+            <div className="grid gap-3">
+              {paginated.map((entry) => {
+                const entryConfig = tabConfig.find((tab) => tab.id === entry.category);
+                const EntryIcon = entryConfig?.icon || FileText;
+                return (
+                  <Card key={entry.id} className="overflow-hidden transition hover:border-blue-200 hover:shadow-md">
+                    <CardContent className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
+                      <div className="flex min-w-0 gap-3">
+                        {entry.thumbnail_data_url ? (
+                          <img src={entry.thumbnail_data_url} alt="" className="h-16 w-24 rounded-md border object-cover" />
+                        ) : (
+                          <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-slate-600">
+                            <EntryIcon className="h-6 w-6" />
+                          </div>
+                        )}
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="truncate font-semibold">{entry.title}</h3>
+                            <Badge variant="outline">{entryConfig?.singularLabel || 'Item'}</Badge>
+                            <StatusBadge status={entry.expiry_status} days={entry.days_delta} />
+                          </div>
+                          <div className="mt-1 text-sm text-muted-foreground">
+                            {entry.category === 'credit_card' && `${entry.public_metadata.network || 'Card'} ending ${entry.sensitive_payload.last4 || '----'}`}
+                            {entry.category === 'ssl_certificate' && `${entry.public_metadata.domain || entry.title} · ${entry.issuer || 'Unknown issuer'}`}
+                            {entry.category === 'id_card' && `${entry.public_metadata.card_type || 'ID'} · ${entry.issuer || 'Unknown authority'}`}
+                            {entry.category === 'document' && (
+                              cloudIntegration(entry)
+                                ? `${entry.file_name || 'File'} · ${cloudProviderLabel(cloudIntegration(entry)?.provider)}`
+                                : `${entry.file_name || 'File'} · ${fileSize(entry.file_size)}`
+                            )}
+                            {entry.category === 'secret' && 'Password / private key'}
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {entry.tags.map((tag) => <Badge key={tag} variant="secondary">{tag}</Badge>)}
+                            {cloudIntegration(entry) && (
+                              <Badge variant="outline" className="gap-1">
+                                <Cloud className="h-3 w-3" />
+                                {cloudProviderLabel(cloudIntegration(entry)?.provider)}
+                              </Badge>
+                            )}
+                            {entry.attachment_versions_count > 0 && <Badge variant="outline">{entry.attachment_versions_count} versions</Badge>}
+                            {entry.signatures_count > 0 && <Badge variant="outline">{entry.signatures_count} signatures</Badge>}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2 md:justify-end">
+                        {entry.category === 'document' && (
+                          <>
+                            {cloudIntegration(entry)?.file_url && (
+                              <Button variant="outline" size="sm" onClick={() => window.open(cloudIntegration(entry)?.file_url, '_blank')}>
+                                <ExternalLink className="mr-2 h-4 w-4" />
+                                Open
+                              </Button>
+                            )}
+                            <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
+                              <History className="mr-2 h-4 w-4" />
+                              History
+                            </Button>
+                            <Button variant="outline" size="sm" onClick={() => loadSignatures(entry).catch((error) => toast.error(error.message || 'Signatures failed'))}>
+                              <PenLine className="mr-2 h-4 w-4" />
+                              Sign
+                            </Button>
+                          </>
+                        )}
+                        <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
+                          <Lock className="mr-2 h-4 w-4" />
+                          Details
+                        </Button>
+                        <Button variant="ghost" size="icon" onClick={() => deleteEntry(entry).catch((error) => toast.error(error.message || 'Delete failed'))}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+                );
+              })}
+              {filtered.length === 0 && (
+                <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground">
+                  <button
+                    type="button"
+                    aria-label="Create item"
+                    className="flex h-12 w-12 items-center justify-center rounded-full border border-dashed border-slate-300 bg-white text-slate-700 shadow-sm transition hover:border-slate-900 hover:text-slate-950"
+                    onClick={() => startNewEntry(activeTab)}
+                  >
+                    <Plus className="h-6 w-6" />
+                  </button>
+                  <div>No DocVault entries match the current filters.</div>
+                  <Button variant="outline" size="sm" onClick={() => startNewEntry(activeTab)}>
+                    <Plus className="h-4 w-4" />
+                    Add Item
+                  </Button>
                 </div>
-                <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-yellow-900">
-                  <div className="text-xs font-medium uppercase">Expiring Soon</div>
-                  <div className="text-2xl font-bold">{summary.expiring}</div>
-                </div>
-                <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-emerald-800">
-                  <div className="text-xs font-medium uppercase">Valid</div>
-                  <div className="text-2xl font-bold">{summary.valid}</div>
+              )}
+            </div>
+
+            {filtered.length > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4 text-sm text-muted-foreground">
+                <div>Page {safePage} of {pageCount}</div>
+                <div className="flex gap-2">
+                  <Button variant="outline" size="sm" disabled={safePage === 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+                    Previous
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={safePage === pageCount} onClick={() => setPage((value) => Math.min(pageCount, value + 1))}>
+                    Next
+                  </Button>
                 </div>
               </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
-              <div className="grid gap-5 lg:grid-cols-[420px_minmax(0,1fr)]">
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-base">
-                      <Plus className="h-4 w-4" />
-                      Add {tab.label.slice(0, -1)}
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    {activeTab === 'credit_card' && <CardVisual form={form} />}
+      <Dialog open={wizardOpen} onOpenChange={(open) => !open && closeWizard()}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Plus className="h-5 w-5 text-blue-700" />
+              Add item
+            </DialogTitle>
+          </DialogHeader>
 
+          <div className="space-y-5">
+            <div className="grid gap-2 sm:grid-cols-3">
+              {['Type', 'Details', 'Review'].map((label, index) => {
+                const step = index + 1;
+                return (
+                  <div key={label} className={`rounded-md border p-3 text-sm ${wizardStep === step ? 'border-blue-200 bg-blue-50 text-blue-800' : 'border-slate-200 bg-white text-slate-500'}`}>
+                    <div className="text-xs font-semibold uppercase">Step {step}</div>
+                    <div className="font-semibold">{label}</div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {wizardStep === 1 && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                {tabConfig.map((tab) => {
+                  const Icon = tab.icon;
+                  const selected = activeTab === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      className={`flex items-center gap-3 rounded-lg border p-4 text-left transition ${selected ? 'border-blue-300 bg-blue-50 text-blue-900' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'}`}
+                      onClick={() => {
+                        setActiveTab(tab.id);
+                        setForm(emptyForm);
+                        setSelectedFile(null);
+                      }}
+                    >
+                      <span className="flex h-10 w-10 items-center justify-center rounded-md bg-slate-100">
+                        <Icon className="h-5 w-5" />
+                      </span>
+                      <span>
+                        <span className="block font-semibold">{tab.singularLabel}</span>
+                        <span className="block text-sm text-muted-foreground">Create a new {tab.singularLabel.toLowerCase()} record</span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {wizardStep === 2 && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <div>
+                    <div className="text-xs font-semibold uppercase text-slate-500">Selected type</div>
+                    <div className="font-semibold text-slate-900">{activeTabConfig.singularLabel}</div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={() => setWizardStep(1)}>Change</Button>
+                </div>
+
+                {activeTab === 'credit_card' && <CardVisual form={form} />}
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label>Title</Label>
+                    <Input ref={titleInputRef} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Holder</Label>
+                    <Input value={form.owner_name} onChange={(e) => setForm({ ...form, owner_name: e.target.value })} />
+                  </div>
+                </div>
+
+                {activeTab === 'credit_card' && (
+                  <>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div className="space-y-1.5">
-                        <Label>Title</Label>
-                        <Input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+                        <Label>Network</Label>
+                        <Select value={form.network} onValueChange={(network) => setForm({ ...form, network })}>
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            {Object.keys(networkStyles).map((network) => <SelectItem key={network} value={network}>{network}</SelectItem>)}
+                          </SelectContent>
+                        </Select>
                       </div>
                       <div className="space-y-1.5">
-                        <Label>Holder</Label>
-                        <Input value={form.owner_name} onChange={(e) => setForm({ ...form, owner_name: e.target.value })} />
+                        <Label>Expiry MM/YY</Label>
+                        <Input placeholder="08/28" value={form.expiry_mm_yy} onChange={(e) => setForm({ ...form, expiry_mm_yy: e.target.value })} />
                       </div>
-                    </div>
-
-                    {activeTab === 'credit_card' && (
-                      <>
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <div className="space-y-1.5">
-                            <Label>Network</Label>
-                            <Select value={form.network} onValueChange={(network) => setForm({ ...form, network })}>
-                              <SelectTrigger><SelectValue /></SelectTrigger>
-                              <SelectContent>
-                                {Object.keys(networkStyles).map((network) => <SelectItem key={network} value={network}>{network}</SelectItem>)}
-                              </SelectContent>
-                            </Select>
-                          </div>
-                          <div className="space-y-1.5">
-                            <Label>Expiry MM/YY</Label>
-                            <Input placeholder="08/28" value={form.expiry_mm_yy} onChange={(e) => setForm({ ...form, expiry_mm_yy: e.target.value })} />
-                          </div>
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label>Card Number</Label>
-                          <Input value={form.card_number} onChange={(e) => setForm({ ...form, card_number: e.target.value })} />
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label>Bank</Label>
-                          <Input value={form.bank} onChange={(e) => setForm({ ...form, bank: e.target.value })} />
-                        </div>
-                      </>
-                    )}
-
-                    {activeTab === 'ssl_certificate' && (
-                      <>
-                        <div className="space-y-1.5">
-                          <Label>Domain</Label>
-                          <Input value={form.domain} onChange={(e) => setForm({ ...form, domain: e.target.value, title: e.target.value || form.title })} />
-                        </div>
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <div className="space-y-1.5">
-                            <Label>Issuer</Label>
-                            <Input value={form.issuer} onChange={(e) => setForm({ ...form, issuer: e.target.value })} />
-                          </div>
-                          <div className="space-y-1.5">
-                            <Label>Issue Date</Label>
-                            <Input type="date" value={form.issue_date} onChange={(e) => setForm({ ...form, issue_date: e.target.value })} />
-                          </div>
-                        </div>
-                      </>
-                    )}
-
-                    {activeTab === 'id_card' && (
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <div className="space-y-1.5">
-                          <Label>Card Type</Label>
-                          <Input value={form.card_type} onChange={(e) => setForm({ ...form, card_type: e.target.value })} />
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label>Issuing Authority</Label>
-                          <Input value={form.issuer} onChange={(e) => setForm({ ...form, issuer: e.target.value })} />
-                        </div>
-                      </div>
-                    )}
-
-                    {activeTab === 'secret' && (
-                      <>
-                        <div className="space-y-1.5">
-                          <Label>Password</Label>
-                          <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
-                        </div>
-                        <div className="space-y-1.5">
-                          <Label>Private Key</Label>
-                          <Textarea value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} />
-                        </div>
-                      </>
-                    )}
-
-                    {activeTab === 'document' && (
-                      <div className="space-y-1.5">
-                        <Label>Retention years</Label>
-                        <Input
-                          type="number"
-                          min="1"
-                          placeholder="7"
-                          value={form.retention_years}
-                          onChange={(e) => setForm({ ...form, retention_years: e.target.value })}
-                        />
-                      </div>
-                    )}
-
-                    {activeTab !== 'credit_card' && activeTab !== 'document' && activeTab !== 'secret' && (
-                      <div className="space-y-1.5">
-                        <Label>Expiry Date</Label>
-                        <div className="flex gap-2">
-                          <Input type="date" value={form.expiry_date} onChange={(e) => setForm({ ...form, expiry_date: e.target.value })} />
-                          <StatusBadge status={preview.status} days={preview.days} />
-                        </div>
-                      </div>
-                    )}
-
-                    {(activeTab === 'credit_card' || activeTab === 'id_card' || activeTab === 'document') && (
-                      <div className="rounded-lg border border-dashed p-4">
-                        <Label className="mb-2 flex items-center gap-2">
-                          <Upload className="h-4 w-4" />
-                          {activeTab === 'document' ? 'Upload Document' : 'AI Scan'}
-                        </Label>
-                        <Input
-                          type="file"
-                          accept={activeTab === 'document' ? undefined : 'image/*'}
-                          onChange={(event) => {
-                            const file = event.target.files?.[0];
-                            if (!file) return;
-                            if (activeTab === 'document') handleFile(file);
-                            else handleScan(file).catch((error) => toast.error(error.message || 'Scan failed'));
-                          }}
-                        />
-                        {selectedFile && <div className="mt-2 text-xs text-muted-foreground">{selectedFile.name} · {fileSize(selectedFile.size)}</div>}
-                      </div>
-                    )}
-
-                    <div className="space-y-1.5">
-                      <Label>Tags</Label>
-                      <Input placeholder="finance, renewal, personal" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} />
                     </div>
                     <div className="space-y-1.5">
-                      <Label>Notes</Label>
-                      <Textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+                      <Label>Card Number</Label>
+                      <Input value={form.card_number} onChange={(e) => setForm({ ...form, card_number: e.target.value })} />
                     </div>
-                    <Button className="w-full" onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}>
-                      Save to Vault
-                    </Button>
-                  </CardContent>
-                </Card>
+                    <div className="space-y-1.5">
+                      <Label>Bank</Label>
+                      <Input value={form.bank} onChange={(e) => setForm({ ...form, bank: e.target.value })} />
+                    </div>
+                  </>
+                )}
 
-                <div className="space-y-3">
-                  <div className="flex flex-wrap gap-2">
-                    <div className="relative min-w-[240px] flex-1">
-                      <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
-                      <Input className="pl-9" placeholder="Filter by name" value={query} onChange={(e) => setQuery(e.target.value)} />
+                {activeTab === 'ssl_certificate' && (
+                  <>
+                    <div className="space-y-1.5">
+                      <Label>Domain</Label>
+                      <Input value={form.domain} onChange={(e) => setForm({ ...form, domain: e.target.value, title: e.target.value || form.title })} />
                     </div>
-                    <Select value={tagFilter || 'all'} onValueChange={(value) => setTagFilter(value === 'all' ? '' : value)}>
-                      <SelectTrigger className="w-[200px]"><SelectValue placeholder="Filter by tag" /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All tags</SelectItem>
-                        {allTags.map((tag) => <SelectItem key={tag} value={tag}>{tag}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label>Issuer</Label>
+                        <Input value={form.issuer} onChange={(e) => setForm({ ...form, issuer: e.target.value })} />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label>Issue Date</Label>
+                        <Input type="date" value={form.issue_date} onChange={(e) => setForm({ ...form, issue_date: e.target.value })} />
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {activeTab === 'id_card' && (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <Label>Card Type</Label>
+                      <Input value={form.card_type} onChange={(e) => setForm({ ...form, card_type: e.target.value })} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Issuing Authority</Label>
+                      <Input value={form.issuer} onChange={(e) => setForm({ ...form, issuer: e.target.value })} />
+                    </div>
                   </div>
+                )}
 
-                  <div className="grid gap-3">
-                    {filtered.map((entry) => (
-                      <Card key={entry.id} className="overflow-hidden">
-                        <CardContent className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
-                          <div className="flex min-w-0 gap-3">
-                            {entry.thumbnail_data_url ? (
-                              <img src={entry.thumbnail_data_url} alt="" className="h-16 w-24 rounded-md border object-cover" />
-                            ) : (
-                              <div className="flex h-16 w-16 items-center justify-center rounded-md bg-muted">
-                                {entry.category === 'credit_card' ? <CreditCard className="h-6 w-6" /> : entry.category === 'secret' ? <KeyRound className="h-6 w-6" /> : <FileText className="h-6 w-6" />}
-                              </div>
-                            )}
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <h3 className="truncate font-semibold">{entry.title}</h3>
-                                <StatusBadge status={entry.expiry_status} days={entry.days_delta} />
-                              </div>
-                              <div className="mt-1 text-sm text-muted-foreground">
-                                {entry.category === 'credit_card' && `${entry.public_metadata.network || 'Card'} ending ${entry.sensitive_payload.last4 || '----'}`}
-                                {entry.category === 'ssl_certificate' && `${entry.public_metadata.domain || entry.title} · ${entry.issuer || 'Unknown issuer'}`}
-                                {entry.category === 'id_card' && `${entry.public_metadata.card_type || 'ID'} · ${entry.issuer || 'Unknown authority'}`}
-                                {entry.category === 'document' && `${entry.file_name || 'File'} · ${fileSize(entry.file_size)}`}
-                                {entry.category === 'secret' && 'Password / private key'}
-                              </div>
-                              <div className="mt-2 flex flex-wrap gap-1">
-                                {entry.tags.map((tag) => <Badge key={tag} variant="secondary">{tag}</Badge>)}
-                                {entry.attachment_versions_count > 0 && <Badge variant="outline">{entry.attachment_versions_count} versions</Badge>}
-                                {entry.signatures_count > 0 && <Badge variant="outline">{entry.signatures_count} signatures</Badge>}
-                              </div>
-                            </div>
+                {activeTab === 'secret' && (
+                  <>
+                    <div className="space-y-1.5">
+                      <Label>Password</Label>
+                      <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Private Key</Label>
+                      <Textarea value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} />
+                    </div>
+                  </>
+                )}
+
+                {activeTab === 'document' && (
+                  <div className="space-y-3">
+                    <div className="space-y-1.5">
+                      <Label>Document source</Label>
+                      <Select
+                        value={form.document_source}
+                        onValueChange={(document_source) => setForm({ ...form, document_source: document_source as DocumentSource })}
+                      >
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="local">Local upload</SelectItem>
+                          <SelectItem value="google_drive">Google Drive</SelectItem>
+                          <SelectItem value="onedrive">OneDrive</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    {form.document_source !== 'local' && (
+                      <>
+                        <div className="space-y-1.5">
+                          <Label className="flex items-center gap-2">
+                            <Link2 className="h-4 w-4" />
+                            {cloudProviderLabel(form.document_source)} share link
+                          </Label>
+                          <Input
+                            placeholder={form.document_source === 'google_drive' ? 'https://drive.google.com/...' : 'https://1drv.ms/...'}
+                            value={form.cloud_url}
+                            onChange={(e) => setForm({ ...form, cloud_url: e.target.value })}
+                          />
+                        </div>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <Label>Cloud file name</Label>
+                            <Input value={form.cloud_file_name} onChange={(e) => setForm({ ...form, cloud_file_name: e.target.value })} />
                           </div>
-                          <div className="flex gap-2">
-                            {entry.category === 'document' && (
-                              <>
-                                <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
-                                  <History className="mr-2 h-4 w-4" />
-                                  History
-                                </Button>
-                                <Button variant="outline" size="sm" onClick={() => loadSignatures(entry).catch((error) => toast.error(error.message || 'Signatures failed'))}>
-                                  <PenLine className="mr-2 h-4 w-4" />
-                                  Sign
-                                </Button>
-                              </>
-                            )}
-                            <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
-                              <Lock className="mr-2 h-4 w-4" />
-                              Details
-                            </Button>
-                            <Button variant="ghost" size="icon" onClick={() => deleteEntry(entry).catch((error) => toast.error(error.message || 'Delete failed'))}>
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
+                          <div className="space-y-1.5">
+                            <Label>Cloud file ID</Label>
+                            <Input value={form.cloud_file_id} onChange={(e) => setForm({ ...form, cloud_file_id: e.target.value })} />
                           </div>
-                        </CardContent>
-                      </Card>
-                    ))}
-                    {filtered.length === 0 && (
-                      <div className="rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground">
-                        No DocVault entries in this tab yet.
-                      </div>
+                        </div>
+                      </>
                     )}
+
+                    <div className="space-y-1.5">
+                      <Label>Retention years</Label>
+                      <Input
+                        type="number"
+                        min="1"
+                        placeholder="7"
+                        value={form.retention_years}
+                        onChange={(e) => setForm({ ...form, retention_years: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {activeTab !== 'credit_card' && activeTab !== 'document' && activeTab !== 'secret' && (
+                  <div className="space-y-1.5">
+                    <Label>Expiry Date</Label>
+                    <div className="flex gap-2">
+                      <Input type="date" value={form.expiry_date} onChange={(e) => setForm({ ...form, expiry_date: e.target.value })} />
+                      <StatusBadge status={preview.status} days={preview.days} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {wizardStep === 3 && (
+              <div className="space-y-4">
+                {(activeTab === 'credit_card' || activeTab === 'id_card' || (activeTab === 'document' && form.document_source === 'local')) && (
+                  <div className="rounded-lg border border-dashed p-4">
+                    <Label className="mb-2 flex items-center gap-2">
+                      <Upload className="h-4 w-4" />
+                      {activeTab === 'document' ? 'Upload Document' : 'AI Scan'}
+                    </Label>
+                    <Input
+                      type="file"
+                      accept={activeTab === 'document' ? undefined : 'image/*'}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (!file) return;
+                        if (activeTab === 'document') handleFile(file);
+                        else handleScan(file).catch((error) => toast.error(error.message || 'Scan failed'));
+                      }}
+                    />
+                    {selectedFile && <div className="mt-2 text-xs text-muted-foreground">{selectedFile.name} · {fileSize(selectedFile.size)}</div>}
+                  </div>
+                )}
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="space-y-1.5">
+                    <Label>Tags</Label>
+                    <Input placeholder="finance, renewal, personal" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} />
+                  </div>
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
+                    <div className="text-xs font-semibold uppercase text-slate-500">Ready to save</div>
+                    <div className="mt-1 font-semibold text-slate-900">{form.title || activeTabConfig.singularLabel}</div>
+                    <div className="text-muted-foreground">{activeTabConfig.singularLabel}</div>
                   </div>
                 </div>
+                <div className="space-y-1.5">
+                  <Label>Notes</Label>
+                  <Textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+                </div>
               </div>
-            </TabsContent>
-          ))}
-        </Tabs>
-      </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4">
+              <Button variant="ghost" onClick={closeWizard}>Cancel</Button>
+              <div className="flex gap-2">
+                <Button variant="outline" disabled={wizardStep === 1} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
+                  Back
+                </Button>
+                {wizardStep < 3 ? (
+                  <Button onClick={() => setWizardStep((step) => Math.min(3, step + 1))}>Next</Button>
+                ) : (
+                  <Button onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}>
+                    Save to Vault
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={!!scanDraft} onOpenChange={(open) => !open && setScanDraft(null)}>
         <DialogContent>
@@ -709,6 +1155,190 @@ export default function DocVault() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Settings className="h-5 w-5" />
+              Vault settings
+            </DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-5 lg:grid-cols-[240px_minmax(0,1fr)]">
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <Label>Default unlock method</Label>
+                <Select value={unlockMethod} onValueChange={(value) => setUnlockMethod(value as UnlockMethod)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {unlockMethods.map((method) => (
+                      <SelectItem key={method.id} value={method.id}>{method.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-2">
+                {unlockMethods.map((method) => (
+                  <button
+                    key={method.id}
+                    type="button"
+                    className={`rounded-lg border p-3 text-left transition ${settingsMethod === method.id ? 'border-blue-300 bg-blue-50 text-blue-900' : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'}`}
+                    onClick={() => setSettingsMethod(method.id)}
+                  >
+                    <div className="font-semibold">{method.label}</div>
+                    <div className="text-sm text-muted-foreground">{unlockSettings.enabled[method.id] ? 'Enabled' : 'Not set up'}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-4 rounded-lg border border-slate-200 bg-white p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-lg font-semibold text-slate-950">{unlockMethods.find((method) => method.id === settingsMethod)?.label}</div>
+                  <div className="text-sm text-muted-foreground">Set up and enable this unlock method.</div>
+                </div>
+                <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={unlockSettings.enabled[settingsMethod]}
+                    onChange={(event) => updateUnlockEnabled(settingsMethod, event.target.checked)}
+                  />
+                  Enabled
+                </label>
+              </div>
+
+              {settingsMethod === 'mfa_google' && (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
+                    Scan the QR code with Google Authenticator, then enter the current 6-digit code to verify enrollment.
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Account label</Label>
+                    <Input
+                      placeholder="name@example.com"
+                      value={unlockSettings.googleAccount}
+                      onChange={(event) => setUnlockSettings((current) => ({ ...current, googleAccount: event.target.value }))}
+                    />
+                  </div>
+                  {mfaEnrollments.find((enrollment) => enrollment.factor_id === 'google_auth' && enrollment.is_verified) && (
+                    <Badge variant="outline">Verified enrollment</Badge>
+                  )}
+                  {mfaSetup?.factor_id === 'google_auth' && (
+                    <div className="space-y-3 rounded-lg border border-blue-100 bg-blue-50 p-3">
+                      {mfaSetup.qr_data_url ? (
+                        <img src={mfaSetup.qr_data_url} alt="Google Authenticator QR code" className="h-44 w-44 rounded-md border bg-white p-2" />
+                      ) : (
+                        <div className="rounded-md border bg-white p-3 text-sm text-muted-foreground">QR generation is unavailable. Enter the manual secret in your authenticator app.</div>
+                      )}
+                      <div className="break-all rounded-md bg-white p-2 font-mono text-xs text-slate-700">{mfaSetup.secret}</div>
+                      <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+                        <Input placeholder="6-digit code" value={mfaVerifyCode} onChange={(event) => setMfaVerifyCode(event.target.value)} />
+                        <Button onClick={() => verifyMfaEnrollment().catch((error) => toast.error(error.message || 'Verification failed'))}>Verify</Button>
+                      </div>
+                    </div>
+                  )}
+                  <Button onClick={() => startMfaEnrollment('mfa_google').catch((error) => toast.error(error.message || 'Enrollment failed'))}>
+                    Generate QR code
+                  </Button>
+                </div>
+              )}
+
+              {settingsMethod === 'mfa_microsoft' && (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
+                    Scan the QR code with Microsoft Authenticator, then enter the current 6-digit code to verify enrollment.
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Account label</Label>
+                    <Input
+                      placeholder="name@example.com"
+                      value={unlockSettings.microsoftAccount}
+                      onChange={(event) => setUnlockSettings((current) => ({ ...current, microsoftAccount: event.target.value }))}
+                    />
+                  </div>
+                  {mfaEnrollments.find((enrollment) => enrollment.factor_id === 'ms_auth' && enrollment.is_verified) && (
+                    <Badge variant="outline">Verified enrollment</Badge>
+                  )}
+                  {mfaSetup?.factor_id === 'ms_auth' && (
+                    <div className="space-y-3 rounded-lg border border-blue-100 bg-blue-50 p-3">
+                      {mfaSetup.qr_data_url ? (
+                        <img src={mfaSetup.qr_data_url} alt="Microsoft Authenticator QR code" className="h-44 w-44 rounded-md border bg-white p-2" />
+                      ) : (
+                        <div className="rounded-md border bg-white p-3 text-sm text-muted-foreground">QR generation is unavailable. Enter the manual secret in your authenticator app.</div>
+                      )}
+                      <div className="break-all rounded-md bg-white p-2 font-mono text-xs text-slate-700">{mfaSetup.secret}</div>
+                      <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+                        <Input placeholder="6-digit code" value={mfaVerifyCode} onChange={(event) => setMfaVerifyCode(event.target.value)} />
+                        <Button onClick={() => verifyMfaEnrollment().catch((error) => toast.error(error.message || 'Verification failed'))}>Verify</Button>
+                      </div>
+                    </div>
+                  )}
+                  <Button onClick={() => startMfaEnrollment('mfa_microsoft').catch((error) => toast.error(error.message || 'Enrollment failed'))}>
+                    Generate QR code
+                  </Button>
+                </div>
+              )}
+
+              {settingsMethod === 'vault_password' && (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
+                    Set a vault password for standalone unlock. In this local plugin view, only setup state is stored locally.
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <Label>Vault password</Label>
+                      <Input type="password" value={passwordDraft} onChange={(event) => setPasswordDraft(event.target.value)} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Confirm password</Label>
+                      <Input type="password" value={passwordConfirmDraft} onChange={(event) => setPasswordConfirmDraft(event.target.value)} />
+                    </div>
+                  </div>
+                  {unlockSettings.passwordSet && <Badge variant="outline">Password configured</Badge>}
+                  <Button onClick={savePasswordMethod}>Save vault password</Button>
+                </div>
+              )}
+
+              {settingsMethod === 'recovery_code' && (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
+                    Add recovery codes separated by spaces or new lines. Store them somewhere safe before closing settings.
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Recovery codes</Label>
+                    <Textarea
+                      placeholder={'CODE-1234\nCODE-5678'}
+                      value={recoveryCodesDraft}
+                      onChange={(event) => setRecoveryCodesDraft(event.target.value)}
+                    />
+                  </div>
+                  {unlockSettings.recoveryCodeCount > 0 && <Badge variant="outline">{unlockSettings.recoveryCodeCount} codes configured</Badge>}
+                  <Button onClick={saveRecoveryCodes}>Save recovery codes</Button>
+                </div>
+              )}
+
+              {settingsMethod === 'local_confirmation' && (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-muted-foreground">
+                    Local confirmation is intended for standalone development and self-hosted fallback mode. Users type UNLOCK to reveal details.
+                  </div>
+                  <Button onClick={() => {
+                    updateUnlockEnabled('local_confirmation', true);
+                    toast.success('Local confirmation enabled');
+                  }}>
+                    Enable local confirmation
+                  </Button>
+                </div>
+              )}
+
+              <div className="flex justify-end border-t border-slate-200 pt-4">
+                <Button onClick={() => setSettingsOpen(false)}>Done</Button>
+              </div>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={!!unlocking} onOpenChange={(open) => !open && setUnlocking(null)}>
         <DialogContent>
           <DialogHeader>
@@ -716,16 +1346,25 @@ export default function DocVault() {
           </DialogHeader>
           <div className="space-y-3">
             <div className="rounded-lg border bg-muted p-3 text-sm text-muted-foreground">
-              Use your enrolled MFA chain or vault password to reveal sensitive details. If you have not configured one yet, go to Settings {'>'} Security and set up a vault password or MFA chain first. In standalone/local fallback mode, type UNLOCK to confirm.
+              Unlock with {selectedUnlockMethod.label}. You can change the default in vault settings.
             </div>
-            <Select value={mfaFactor} onValueChange={setMfaFactor}>
+            <Select value={unlockMethod} onValueChange={(value) => setUnlockMethod(value as UnlockMethod)}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="google_auth">Google Authenticator</SelectItem>
-                <SelectItem value="ms_auth">Microsoft Authenticator</SelectItem>
+                {unlockMethods.map((method) => (
+                  <SelectItem key={method.id} value={method.id}>{method.label}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
-            <Input value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} placeholder="6-digit code or UNLOCK" />
+            <div className="space-y-1.5">
+              <Label>{selectedUnlockMethod.inputLabel}</Label>
+              <Input
+                type={selectedUnlockMethod.inputType || 'text'}
+                value={mfaCode}
+                onChange={(event) => setMfaCode(event.target.value)}
+                placeholder={selectedUnlockMethod.placeholder}
+              />
+            </div>
             <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>Unlock</Button>
           </div>
         </DialogContent>
@@ -742,7 +1381,22 @@ export default function DocVault() {
                 <div className="font-semibold">{unlocked.title}</div>
                 <div className="text-sm text-muted-foreground">{unlocked.notes || 'No private notes'}</div>
               </div>
+              {cloudIntegration(unlocked)?.file_url && (
+                <div className="rounded-lg border p-3 text-sm">
+                  <div className="font-medium">{cloudProviderLabel(cloudIntegration(unlocked)?.provider)}</div>
+                  <div className="mt-1 break-all text-muted-foreground">{cloudIntegration(unlocked)?.file_url}</div>
+                  {cloudIntegration(unlocked)?.file_id && (
+                    <div className="mt-1 font-mono text-xs text-muted-foreground">{cloudIntegration(unlocked)?.file_id}</div>
+                  )}
+                </div>
+              )}
               <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(unlocked.sensitive_payload, null, 2)}</pre>
+              {cloudIntegration(unlocked)?.file_url && (
+                <Button variant="outline" onClick={() => window.open(cloudIntegration(unlocked)?.file_url, '_blank')}>
+                  <ExternalLink className="mr-2 h-4 w-4" />
+                  Open cloud file
+                </Button>
+              )}
               {unlocked.file_data_url && <Button variant="outline" onClick={() => window.open(unlocked.file_data_url!, '_blank')}>Open file</Button>}
               <Button
                 variant="outline"

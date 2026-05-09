@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import re
 import hashlib
+import base64
+import hmac
+import io
+import secrets
+import struct
+import time
 from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -25,15 +32,20 @@ except ModuleNotFoundError:
     def log_audit_event(**kwargs):
         return None
 
-from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultSignature
+from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultMFAEnrollment, DocVaultSignature
 from .schemas import (
     DocVaultAttachmentVersionCreate,
     DocVaultAttachmentVersionResponse,
     DocVaultAuditPackageRequest,
     DocVaultAuditPackageResponse,
+    DocVaultCloudLinkRequest,
     DocVaultEntryCreate,
     DocVaultEntryResponse,
     DocVaultEntryUpdate,
+    DocVaultMFAEnrollmentResponse,
+    DocVaultMFASetupRequest,
+    DocVaultMFASetupResponse,
+    DocVaultMFAVerifyRequest,
     DocVaultRetentionRunResponse,
     DocVaultScanRequest,
     DocVaultScanResponse,
@@ -76,6 +88,27 @@ def _mask_entry_payload(category: str, payload: dict[str, Any] | None) -> dict[s
 
 def _checksum(data: str | None) -> str:
     return hashlib.sha256((data or "").encode("utf-8")).hexdigest()
+
+
+def _provider_label(provider: str) -> str:
+    return {"google_drive": "Google Drive", "onedrive": "OneDrive"}.get(provider, provider)
+
+
+def _normalize_cloud_link(payload: DocVaultCloudLinkRequest) -> dict[str, Any]:
+    url = payload.file_url.strip()
+    hostname = (urlparse(url).hostname or "").lower()
+    if payload.provider == "google_drive" and hostname not in {"drive.google.com", "docs.google.com"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google Drive links must use drive.google.com or docs.google.com")
+    if payload.provider == "onedrive" and hostname not in {"onedrive.live.com", "1drv.ms"} and not hostname.endswith(".sharepoint.com"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OneDrive links must use onedrive.live.com, 1drv.ms, or sharepoint.com")
+    return {
+        "provider": payload.provider,
+        "provider_label": _provider_label(payload.provider),
+        "file_url": url,
+        "file_id": payload.file_id,
+        "file_name": payload.file_name,
+        "linked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _version_response(version: DocVaultAttachmentVersion) -> DocVaultAttachmentVersionResponse:
@@ -166,6 +199,50 @@ def _get_entry_or_404(db: Session, entry_id: int) -> DocVaultEntry:
     return entry
 
 
+def _totp_code(secret: str, counter: int) -> str:
+    key = base64.b32decode(secret.upper())
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{value % 1000000:06d}"
+
+
+def _verify_totp(secret: str, code: str, window: int = 1) -> bool:
+    normalized = re.sub(r"\s", "", code)
+    counter = int(time.time() // 30)
+    for drift in range(-window, window + 1):
+        if hmac.compare_digest(_totp_code(secret, counter + drift), normalized):
+            return True
+    return False
+
+
+def _otpauth_uri(secret: str, *, label: str, issuer: str = "DocVault") -> str:
+    return f"otpauth://totp/{quote(issuer)}:{quote(label)}?secret={secret}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30"
+
+
+def _qr_data_url(value: str) -> str | None:
+    try:
+        import qrcode
+    except ModuleNotFoundError:
+        return None
+    image = qrcode.make(value)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _mfa_response(enrollment: DocVaultMFAEnrollment) -> DocVaultMFAEnrollmentResponse:
+    return DocVaultMFAEnrollmentResponse(
+        factor_id=enrollment.factor_id,
+        label=enrollment.label,
+        is_verified=enrollment.is_verified,
+        created_at=enrollment.created_at,
+        verified_at=enrollment.verified_at,
+    )
+
+
 def _latest_version_number(db: Session, entry_id: int) -> int:
     latest = (
         db.query(DocVaultAttachmentVersion)
@@ -208,20 +285,35 @@ def _create_attachment_version(
 
 
 def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRequest) -> None:
+    local_unlock_factors = {"local_fallback", "vault_password", "recovery_code"}
+    enrollment = db.query(DocVaultMFAEnrollment).filter(
+        DocVaultMFAEnrollment.user_id == current_user.id,
+        DocVaultMFAEnrollment.factor_id == payload.factor_id,
+        DocVaultMFAEnrollment.is_verified.is_(True),
+    ).first()
+    if enrollment:
+        if _verify_totp(enrollment.secret, payload.user_input, payload.window):
+            return
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authenticator code")
+
     try:
         from commercial.mfa_chain.utils import get_user_mfa_settings, verify_factor_enrollment
     except ModuleNotFoundError:
-        if payload.user_input == "UNLOCK":
+        if payload.factor_id == "local_fallback" and payload.user_input == "UNLOCK":
+            return
+        if payload.factor_id in {"vault_password", "recovery_code"} and payload.user_input.strip():
             return
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="MFA library is unavailable. Type UNLOCK only in local fallback mode.",
+            detail="MFA library is unavailable. Use a local unlock method or type UNLOCK in local fallback mode.",
         )
 
     tenant_user = db.query(TenantUser).filter(TenantUser.id == current_user.id).first()
     user_for_mfa = tenant_user or current_user
     settings = get_user_mfa_settings(user_for_mfa)
     if settings.get("enabled"):
+        if payload.factor_id in local_unlock_factors:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Use an enrolled MFA factor for this vault")
         if payload.factor_id not in settings.get("enrolled_factors", []):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Authenticator is not enrolled")
         if not verify_factor_enrollment(user_for_mfa, payload.factor_id, payload.user_input, payload.window):
@@ -255,13 +347,101 @@ async def list_entries(
     return [_serialize_with_counts(db, entry) for entry in sorted(entries, key=_sort_key)]
 
 
+@router.get("/mfa/enrollments", response_model=list[DocVaultMFAEnrollmentResponse])
+async def list_mfa_enrollments(
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    enrollments = db.query(DocVaultMFAEnrollment).filter(DocVaultMFAEnrollment.user_id == current_user.id).all()
+    return [_mfa_response(enrollment) for enrollment in enrollments]
+
+
+@router.post("/mfa/enrollments/setup", response_model=DocVaultMFASetupResponse)
+async def setup_mfa_enrollment(
+    payload: DocVaultMFASetupRequest,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    label = payload.label or current_user.email or "DocVault user"
+    secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+    enrollment = db.query(DocVaultMFAEnrollment).filter(
+        DocVaultMFAEnrollment.user_id == current_user.id,
+        DocVaultMFAEnrollment.factor_id == payload.factor_id,
+    ).first()
+    if enrollment:
+        enrollment.label = label
+        enrollment.secret = secret
+        enrollment.is_verified = False
+        enrollment.verified_at = None
+    else:
+        enrollment = DocVaultMFAEnrollment(
+            user_id=current_user.id,
+            factor_id=payload.factor_id,
+            label=label,
+            secret=secret,
+            is_verified=False,
+        )
+    db.add(enrollment)
+    db.commit()
+    db.refresh(enrollment)
+
+    uri = _otpauth_uri(secret, label=label)
+    return DocVaultMFASetupResponse(
+        factor_id=enrollment.factor_id,
+        label=enrollment.label,
+        secret=secret,
+        otpauth_uri=uri,
+        qr_data_url=_qr_data_url(uri),
+        is_verified=enrollment.is_verified,
+    )
+
+
+@router.post("/mfa/enrollments/verify", response_model=DocVaultMFAEnrollmentResponse)
+async def verify_mfa_enrollment(
+    payload: DocVaultMFAVerifyRequest,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    enrollment = db.query(DocVaultMFAEnrollment).filter(
+        DocVaultMFAEnrollment.user_id == current_user.id,
+        DocVaultMFAEnrollment.factor_id == payload.factor_id,
+    ).first()
+    if not enrollment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MFA enrollment not found")
+    if not _verify_totp(enrollment.secret, payload.code, payload.window):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid authenticator code")
+    enrollment.is_verified = True
+    enrollment.verified_at = datetime.now(timezone.utc)
+    db.add(enrollment)
+    db.commit()
+    db.refresh(enrollment)
+    return _mfa_response(enrollment)
+
+
 @router.post("", response_model=DocVaultEntryResponse, status_code=status.HTTP_201_CREATED)
 async def create_entry(
     payload: DocVaultEntryCreate,
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
-    entry = DocVaultEntry(**payload.model_dump(), created_by=current_user.id)
+    values = payload.model_dump()
+    metadata = dict(values.get("public_metadata") or {})
+    cloud_integration = metadata.get("cloud_integration")
+    if values.get("category") == "document" and cloud_integration:
+        if cloud_integration.get("provider") not in {"google_drive", "onedrive"} or not cloud_integration.get("file_url"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cloud document links require google_drive or onedrive and file_url")
+        cloud_payload = DocVaultCloudLinkRequest(
+            provider=cloud_integration.get("provider"),
+            file_url=cloud_integration.get("file_url"),
+            file_id=cloud_integration.get("file_id"),
+            file_name=cloud_integration.get("file_name") or values.get("file_name"),
+            file_mime_type=values.get("file_mime_type"),
+        )
+        metadata["cloud_integration"] = _normalize_cloud_link(cloud_payload)
+        values["public_metadata"] = metadata
+        values["file_name"] = values.get("file_name") or cloud_payload.file_name or _provider_label(cloud_payload.provider)
+        values["file_data_url"] = None
+    entry = DocVaultEntry(**values, created_by=current_user.id)
     db.add(entry)
     db.commit()
     db.refresh(entry)
@@ -273,7 +453,7 @@ async def create_entry(
             file_mime_type=entry.file_mime_type,
             file_size=entry.file_size,
             file_data_url=entry.file_data_url,
-            change_note="Initial upload",
+            change_note="Initial cloud link" if cloud_integration else "Initial upload",
             user_id=current_user.id,
         )
         db.commit()
@@ -427,6 +607,47 @@ async def create_attachment_version(
         details={"version": version.version, "checksum_sha256": version.checksum_sha256},
     )
     return _version_response(version)
+
+
+@router.post("/{entry_id}/cloud-link", response_model=DocVaultEntryResponse)
+async def link_cloud_document(
+    entry_id: int,
+    payload: DocVaultCloudLinkRequest,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    entry = _get_entry_or_404(db, entry_id)
+    metadata = dict(entry.public_metadata or {})
+    metadata["cloud_integration"] = _normalize_cloud_link(payload)
+    entry.category = "document"
+    entry.public_metadata = metadata
+    entry.file_name = payload.file_name or entry.file_name or _provider_label(payload.provider)
+    entry.file_mime_type = payload.file_mime_type or entry.file_mime_type
+    entry.file_data_url = None
+    _create_attachment_version(
+        db,
+        entry,
+        file_name=entry.file_name,
+        file_mime_type=entry.file_mime_type,
+        file_size=entry.file_size,
+        file_data_url=None,
+        change_note=payload.change_note or f"Linked {_provider_label(payload.provider)} file",
+        user_id=current_user.id,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_CLOUD_LINK",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"provider": payload.provider, "file_name": entry.file_name},
+    )
+    return _serialize_with_counts(db, entry)
 
 
 @router.get("/{entry_id}/signatures", response_model=list[DocVaultSignatureResponse])

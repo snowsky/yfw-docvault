@@ -1,5 +1,9 @@
+import React from 'react';
+
 import { cx, type PrimitiveProps } from './primitives';
 
-export function Input({ className, ...props }: PrimitiveProps<'input'>) {
-  return <input className={cx('dv-input', className)} {...props} />;
-}
+export const Input = React.forwardRef<HTMLInputElement, PrimitiveProps<'input'>>(
+  ({ className, ...props }, ref) => <input ref={ref} className={cx('dv-input', className)} {...props} />,
+);
+
+Input.displayName = 'Input';

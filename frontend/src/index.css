@@ -3,19 +3,19 @@
 @tailwind utilities;
 
 :root {
-  --background: 210 20% 98%;
-  --foreground: 220 13% 18%;
+  --background: 210 30% 98%;
+  --foreground: 222 22% 14%;
   --card: 0 0% 100%;
-  --card-foreground: 220 13% 18%;
-  --primary: 221 83% 53%;
+  --card-foreground: 222 22% 14%;
+  --primary: 220 72% 42%;
   --primary-foreground: 210 20% 98%;
-  --muted: 210 40% 96%;
-  --muted-foreground: 215 16% 47%;
+  --muted: 210 24% 95%;
+  --muted-foreground: 216 13% 43%;
   --destructive: 0 84% 60%;
   --destructive-foreground: 210 20% 98%;
-  --border: 214 32% 91%;
-  --input: 214 32% 91%;
-  --ring: 221 83% 53%;
+  --border: 215 20% 88%;
+  --input: 215 20% 88%;
+  --ring: 220 72% 42%;
   --radius: 0.5rem;
   color: hsl(var(--foreground));
   background: hsl(var(--background));
@@ -28,7 +28,8 @@
 
 body {
   margin: 0;
-  background: hsl(var(--background));
+  background:
+    linear-gradient(180deg, #eef4fb 0, #f8fafc 340px, #f8fafc 100%);
 }
 
 button,
@@ -39,10 +40,10 @@ textarea {
 }
 
 .dv-card {
-  background: white;
-  border: 1px solid #e5e7eb;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
 }
 
 .dv-card-header {
@@ -55,6 +56,7 @@ textarea {
 
 .dv-card-title {
   font-weight: 650;
+  color: #111827;
 }
 
 .dv-button {
@@ -63,24 +65,44 @@ textarea {
   justify-content: center;
   gap: 8px;
   min-height: 38px;
-  border: 1px solid #0f172a;
+  border: 1px solid #1d4ed8;
   border-radius: 6px;
-  background: #0f172a;
+  background: #1d4ed8;
   color: white;
-  padding: 8px 12px;
+  padding: 8px 13px;
   cursor: pointer;
+  font-weight: 650;
+  transition: background 160ms ease, border-color 160ms ease, box-shadow 160ms ease, color 160ms ease;
+}
+
+.dv-button:hover {
+  border-color: #1e40af;
+  background: #1e40af;
+  box-shadow: 0 8px 18px rgba(29, 78, 216, 0.18);
 }
 
 .dv-button-outline {
-  border-color: #d1d5db;
+  border-color: #cbd5e1;
   background: white;
-  color: #111827;
+  color: #1e293b;
+}
+
+.dv-button-outline:hover {
+  border-color: #94a3b8;
+  background: #f8fafc;
+  box-shadow: none;
 }
 
 .dv-button-ghost {
   border-color: transparent;
   background: transparent;
-  color: #374151;
+  color: #475569;
+}
+
+.dv-button-ghost:hover {
+  border-color: #e2e8f0;
+  background: #f8fafc;
+  box-shadow: none;
 }
 
 .dv-button-sm {
@@ -99,11 +121,20 @@ textarea {
 .dv-textarea,
 .dv-select {
   width: 100%;
-  border: 1px solid #d1d5db;
+  border: 1px solid #cbd5e1;
   border-radius: 6px;
   background: white;
-  color: #111827;
-  padding: 8px 10px;
+  color: #0f172a;
+  padding: 9px 11px;
+  outline: none;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.dv-input:focus,
+.dv-textarea:focus,
+.dv-select:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
 }
 
 .dv-textarea {
@@ -113,9 +144,10 @@ textarea {
 
 .dv-label {
   display: block;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  color: #374151;
+  color: #475569;
+  letter-spacing: 0;
 }
 
 .dv-badge {
@@ -123,8 +155,8 @@ textarea {
   align-items: center;
   gap: 6px;
   border-radius: 999px;
-  border: 1px solid #d1d5db;
-  padding: 3px 8px;
+  border: 1px solid #cbd5e1;
+  padding: 4px 8px;
   font-size: 12px;
   font-weight: 600;
 }
@@ -137,11 +169,17 @@ textarea {
 
 .dv-badge-outline {
   background: white;
+  color: #334155;
 }
 
 .dv-tabs-list {
   display: grid;
   gap: 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 6px;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
 }
 
 .dv-tab-trigger {
@@ -149,18 +187,25 @@ textarea {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 38px;
-  border: 1px solid #e5e7eb;
+  min-height: 40px;
+  border: 1px solid transparent;
   border-radius: 6px;
-  background: white;
-  color: #374151;
+  background: transparent;
+  color: #475569;
   cursor: pointer;
+  font-weight: 650;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.dv-tab-trigger:hover {
+  background: #f8fafc;
+  color: #0f172a;
 }
 
 .dv-tab-active {
-  border-color: #0f172a;
-  background: #0f172a;
-  color: white;
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
 }
 
 .dv-select-shell {
