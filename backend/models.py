@@ -78,7 +78,7 @@ class DocVaultEntryHistory(Base):
     action = Column(String, nullable=False)
     changed_fields = Column(JSON, nullable=False, default=list)
     details = Column(JSON, nullable=True)
-    snapshot = Column(EncryptedJSON(), nullable=True)
+    snapshot = Column(JSON, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
