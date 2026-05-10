@@ -670,6 +670,7 @@ export default function DocVault() {
   const [page, setPage] = React.useState(1);
   const [form, setForm] = React.useState(emptyForm);
   const [wizardOpen, setWizardOpen] = React.useState(false);
+  const [editingEntry, setEditingEntry] = React.useState<DocVaultEntry | null>(null);
   const [wizardStep, setWizardStep] = React.useState(1);
   const [scanDraft, setScanDraft] = React.useState<Record<string, any> | null>(null);
   const [unlocking, setUnlocking] = React.useState<DocVaultEntry | null>(null);
@@ -1004,6 +1005,7 @@ export default function DocVault() {
   async function saveEntry() {
     const metadata: Record<string, any> = {};
     const sensitive: Record<string, any> = {};
+    const isEditing = Boolean(editingEntry);
     let title = form.title.trim();
     let issuer = form.issuer.trim();
     let expiryDate = form.expiry_date || null;
@@ -1013,9 +1015,11 @@ export default function DocVault() {
       metadata.network = form.network;
       metadata.bank = form.bank;
       metadata.expiry_mm_yy = form.expiry_mm_yy;
-      sensitive.card_number = form.card_number.replace(/\s/g, '');
-      sensitive.last4 = sensitive.card_number.slice(-4);
-      title = title || `${form.network} ${sensitive.last4 || 'Card'}`;
+      if (form.card_number.trim()) {
+        sensitive.card_number = form.card_number.replace(/\s/g, '');
+        sensitive.last4 = sensitive.card_number.slice(-4);
+      }
+      title = title || `${form.network} ${sensitive.last4 || editingEntry?.sensitive_payload.last4 || 'Card'}`;
       issuer = issuer || form.bank;
       if (form.expiry_mm_yy.match(/^\d{2}\/\d{2}$/)) {
         const [month, year] = form.expiry_mm_yy.split('/');
@@ -1039,7 +1043,7 @@ export default function DocVault() {
       metadata.approval_status = form.approval_status;
       if (form.retention_years) {
         metadata.retention_years = Number(form.retention_years);
-        metadata.retention_start_date = new Date().toISOString().slice(0, 10);
+        metadata.retention_start_date = editingEntry?.public_metadata.retention_start_date || new Date().toISOString().slice(0, 10);
       }
       if (form.document_source !== 'local') {
         if (!form.cloud_url.trim()) {
@@ -1059,8 +1063,8 @@ export default function DocVault() {
       metadata.username = form.username.trim();
       metadata.login_url = form.login_url.trim();
       metadata.rotation_interval_days = Number(form.rotation_interval_days || 180);
-      sensitive.password = form.password;
-      sensitive.private_key = form.private_key;
+      if (form.password) sensitive.password = form.password;
+      if (form.private_key) sensitive.private_key = form.private_key;
     }
 
     if (!title) {
@@ -1068,37 +1072,51 @@ export default function DocVault() {
       return;
     }
 
-    await apiRequest<DocVaultEntry>('/docvault', {
-      method: 'POST',
-      body: JSON.stringify({
-        category: activeTab,
-        title,
-        owner_name: form.owner_name || null,
-        issuer: issuer || null,
-        expiry_date: expiryDate,
-        issue_date: form.issue_date || null,
-        public_metadata: metadata,
-        sensitive_payload: sensitive,
-        notes: form.notes || null,
-        tags: form.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
-        thumbnail_data_url: activeTab === 'id_card' ? selectedFile?.dataUrl : null,
-        file_name: activeTab === 'document' && form.document_source !== 'local'
-          ? form.cloud_file_name || title
-          : selectedFile?.name || null,
-        file_mime_type: activeTab === 'document' && form.document_source !== 'local'
-          ? 'application/vnd.docvault.cloud-link'
-          : selectedFile?.type || null,
-        file_size: activeTab === 'document' && form.document_source !== 'local' ? null : selectedFile?.size || null,
-        file_data_url: activeTab === 'document' && form.document_source === 'local' ? selectedFile?.dataUrl : null,
-      }),
+    const payload: Record<string, any> = {
+      title,
+      owner_name: form.owner_name || null,
+      issuer: issuer || null,
+      expiry_date: expiryDate,
+      issue_date: form.issue_date || null,
+      public_metadata: metadata,
+      tags: form.tags.split(',').map((tag) => tag.trim()).filter(Boolean),
+      thumbnail_data_url: activeTab === 'id_card' ? selectedFile?.dataUrl || editingEntry?.thumbnail_data_url || null : null,
+    };
+    if (!isEditing || form.notes.trim()) {
+      payload.notes = form.notes || null;
+    }
+    if (!isEditing) {
+      payload.category = activeTab;
+    }
+    if (Object.keys(sensitive).length > 0 || !isEditing) {
+      payload.sensitive_payload = sensitive;
+    }
+    if (!isEditing || selectedFile || activeTab === 'document') {
+      payload.file_name = activeTab === 'document' && form.document_source !== 'local'
+        ? form.cloud_file_name || title
+        : selectedFile?.name || (isEditing ? editingEntry?.file_name || null : null);
+      payload.file_mime_type = activeTab === 'document' && form.document_source !== 'local'
+        ? 'application/vnd.docvault.cloud-link'
+        : selectedFile?.type || (isEditing ? editingEntry?.file_mime_type || null : null);
+      payload.file_size = activeTab === 'document' && form.document_source !== 'local'
+        ? null
+        : selectedFile?.size || (isEditing ? editingEntry?.file_size || null : null);
+      if (!isEditing || selectedFile) {
+        payload.file_data_url = activeTab === 'document' && form.document_source === 'local' ? selectedFile?.dataUrl : null;
+      }
+    }
+    await apiRequest<DocVaultEntry>(isEditing ? `/docvault/${editingEntry!.id}` : '/docvault', {
+      method: isEditing ? 'PUT' : 'POST',
+      body: JSON.stringify(payload),
     });
     setForm(emptyForm);
     setSelectedFile(null);
     setCertificateInfo(null);
+    setEditingEntry(null);
     setWizardOpen(false);
     setWizardStep(1);
     await loadEntries();
-    toast.success('Saved to DocVault');
+    toast.success(isEditing ? 'DocVault item updated' : 'Saved to DocVault');
   }
 
   async function deleteEntry(entry: DocVaultEntry) {
@@ -1233,9 +1251,55 @@ export default function DocVault() {
     });
   }
 
+  function startEditEntry(entry: DocVaultEntry) {
+    if (isImmutable(entry)) {
+      toast.error('Immutable items cannot be edited');
+      return;
+    }
+    const cloud = cloudIntegration(entry);
+    const metadata = entry.public_metadata || {};
+    setEditingEntry(entry);
+    setActiveTab(entry.category);
+    setForm({
+      ...emptyForm,
+      title: entry.title || '',
+      owner_name: entry.owner_name || '',
+      issuer: entry.issuer || '',
+      expiry_date: entry.expiry_date || '',
+      issue_date: entry.issue_date || '',
+      notes: entry.notes || '',
+      tags: (entry.tags || []).join(', '),
+      network: metadata.network || emptyForm.network,
+      expiry_mm_yy: metadata.expiry_mm_yy || '',
+      bank: metadata.bank || '',
+      domain: metadata.domain || '',
+      card_type: metadata.card_type || '',
+      username: metadata.username || '',
+      login_url: metadata.login_url || '',
+      rotation_interval_days: String(metadata.rotation_interval_days || emptyForm.rotation_interval_days),
+      retention_years: metadata.retention_years ? String(metadata.retention_years) : '',
+      document_source: (cloud?.provider || 'local') as DocumentSource,
+      document_label: documentLabel(entry),
+      approval_status: approvalStatus(entry),
+      cloud_url: cloud?.file_url || '',
+      cloud_file_id: cloud?.file_id || '',
+      cloud_file_name: cloud?.file_name || entry.file_name || '',
+      immutable: false,
+    });
+    setSelectedFile(null);
+    setCertificateInfo(null);
+    setScanDraft(null);
+    setWizardStep(2);
+    setWizardOpen(true);
+    window.requestAnimationFrame(() => {
+      titleInputRef.current?.focus();
+    });
+  }
+
   function closeWizard() {
     setWizardOpen(false);
     setWizardStep(1);
+    setEditingEntry(null);
     setForm(emptyForm);
     setSelectedFile(null);
     setCertificateInfo(null);
@@ -1440,6 +1504,12 @@ export default function DocVault() {
                           <Lock className="mr-2 h-4 w-4" />
                           Details
                         </Button>
+                        {!isImmutable(entry) && (
+                          <Button variant="outline" size="sm" onClick={() => startEditEntry(entry)}>
+                            <PenLine className="mr-2 h-4 w-4" />
+                            Edit
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="icon"
@@ -1528,8 +1598,8 @@ export default function DocVault() {
         <DialogContent className="max-w-3xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <Plus className="h-5 w-5 text-blue-700" />
-              Add item
+              {editingEntry ? <PenLine className="h-5 w-5 text-blue-700" /> : <Plus className="h-5 w-5 text-blue-700" />}
+              {editingEntry ? 'Edit item' : 'Add item'}
             </DialogTitle>
           </DialogHeader>
 
@@ -1546,7 +1616,7 @@ export default function DocVault() {
               })}
             </div>
 
-            {wizardStep === 1 && (
+            {wizardStep === 1 && !editingEntry && (
               <div className="grid gap-3 sm:grid-cols-2">
                 {tabConfig.map((tab) => {
                   const Icon = tab.icon;
@@ -1583,7 +1653,7 @@ export default function DocVault() {
                     <div className="text-xs font-semibold uppercase text-slate-500">Selected type</div>
                     <div className="font-semibold text-slate-900">{activeTabConfig.singularLabel}</div>
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => setWizardStep(1)}>Change</Button>
+                  {!editingEntry && <Button variant="outline" size="sm" onClick={() => setWizardStep(1)}>Change</Button>}
                 </div>
 
                 {activeTab === 'credit_card' && <CardVisual form={form} />}
@@ -1619,6 +1689,7 @@ export default function DocVault() {
                     <div className="space-y-1.5">
                       <Label>Card Number</Label>
                       <Input value={form.card_number} onChange={(e) => setForm({ ...form, card_number: e.target.value })} />
+                      {editingEntry && <div className="text-xs text-muted-foreground">Leave blank to keep the saved card number unchanged.</div>}
                     </div>
                     <div className="space-y-1.5">
                       <Label>Bank</Label>
@@ -1731,6 +1802,7 @@ export default function DocVault() {
                     <div className="space-y-1.5">
                       <Label>Private Key</Label>
                       <Textarea value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} />
+                      {editingEntry && <div className="text-xs text-muted-foreground">Leave password and private key fields blank to keep saved secret values unchanged.</div>}
                     </div>
                   </>
                 )}
@@ -1866,21 +1938,24 @@ export default function DocVault() {
                     <div className="text-muted-foreground">{activeTabConfig.singularLabel}</div>
                   </div>
                 </div>
-                <label className="flex items-start gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
-                  <input
-                    type="checkbox"
-                    className="mt-1 h-4 w-4"
-                    checked={form.immutable}
-                    onChange={(event) => setForm({ ...form, immutable: event.target.checked })}
-                  />
-                  <span>
-                    <span className="block font-semibold text-slate-900">Make this item immutable</span>
-                    <span className="block text-muted-foreground">After saving, this item cannot be edited, archived, relinked, or replaced.</span>
-                  </span>
-                </label>
+                {!editingEntry && (
+                  <label className="flex items-start gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-4 w-4"
+                      checked={form.immutable}
+                      onChange={(event) => setForm({ ...form, immutable: event.target.checked })}
+                    />
+                    <span>
+                      <span className="block font-semibold text-slate-900">Make this item immutable</span>
+                      <span className="block text-muted-foreground">After saving, this item cannot be edited, archived, relinked, or replaced.</span>
+                    </span>
+                  </label>
+                )}
                 <div className="space-y-1.5">
                   <Label>Notes</Label>
                   <Textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+                  {editingEntry && <div className="text-xs text-muted-foreground">Leave blank to keep private notes unchanged.</div>}
                 </div>
               </div>
             )}
@@ -1888,14 +1963,14 @@ export default function DocVault() {
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4">
               <Button variant="ghost" onClick={closeWizard}>Cancel</Button>
               <div className="flex gap-2">
-                <Button variant="outline" disabled={wizardStep === 1} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
+                <Button variant="outline" disabled={wizardStep === 1 || Boolean(editingEntry && wizardStep === 2)} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
                   Back
                 </Button>
                 {wizardStep < 3 ? (
                   <Button onClick={() => setWizardStep((step) => Math.min(3, step + 1))}>Next</Button>
                 ) : (
                   <Button onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}>
-                    Save to Vault
+                    {editingEntry ? 'Save Changes' : 'Save to Vault'}
                   </Button>
                 )}
               </div>
