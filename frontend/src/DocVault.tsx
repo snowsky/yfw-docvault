@@ -478,10 +478,17 @@ function sourceRecordUrl(entry: DocVaultEntry) {
   if (typeof metadata.source_url === 'string' && metadata.source_url) {
     return metadata.source_url;
   }
-  if (metadata.source_owner_type === 'statement' && metadata.source_owner_id) {
-    return `/statements?id=${metadata.source_owner_id}`;
+  if (!metadata.source_owner_id) {
+    return null;
   }
-  return null;
+  const routes: Record<string, string> = {
+    statement: `/statements?id=${metadata.source_owner_id}`,
+    invoice: `/invoices/view/${metadata.source_owner_id}`,
+    expense: `/expenses/view/${metadata.source_owner_id}`,
+    inventory: `/inventory/view/${metadata.source_owner_id}`,
+    portfolio: `/investments/portfolio/${metadata.source_owner_id}`,
+  };
+  return routes[String(metadata.source_owner_type)] || null;
 }
 
 function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {

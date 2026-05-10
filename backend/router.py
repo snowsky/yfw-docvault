@@ -784,6 +784,16 @@ def _statement_reference_key(statement_id: int) -> str:
     return f"docvault://statement/{statement_id}"
 
 
+def _source_url(owner_type: str, owner_id: int) -> str | None:
+    return {
+        "statement": f"/statements?id={owner_id}",
+        "invoice": f"/invoices/view/{owner_id}",
+        "expense": f"/expenses/view/{owner_id}",
+        "inventory": f"/inventory/view/{owner_id}",
+        "portfolio": f"/investments/portfolio/{owner_id}",
+    }.get(owner_type)
+
+
 def _locator_for_source(db: Session, source_table: str, source_attachment_id: int) -> DocVaultAttachmentLocator | None:
     return (
         db.query(DocVaultAttachmentLocator)
@@ -1106,7 +1116,7 @@ def _create_imported_document(
             "source_attachment_id": candidate.source_attachment_id,
             "source_owner_type": candidate.owner_type,
             "source_owner_id": candidate.owner_id,
-            "source_url": f"/statements?id={candidate.owner_id}" if candidate.owner_type == "statement" else None,
+            "source_url": _source_url(candidate.owner_type, candidate.owner_id),
             "import_note": import_note,
             "document_label": "finance",
             "approval_status": "draft",
