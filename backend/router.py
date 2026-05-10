@@ -921,6 +921,23 @@ def _create_imported_document(
         user_id=current_user.id,
         checksum_sha256=candidate.checksum_sha256,
     )
+    import_snapshot = {
+        "category": "document",
+        "title": candidate.file_name,
+        "owner_name": None,
+        "issuer": None,
+        "expiry_date": None,
+        "issue_date": None,
+        "public_metadata": dict(metadata),
+        "sensitive_payload": {},
+        "notes": None,
+        "tags": ["imported", candidate.component],
+        "thumbnail_data_url": None,
+        "file_name": candidate.file_name,
+        "file_mime_type": candidate.file_mime_type,
+        "file_size": candidate.file_size,
+        "file_data_url": None,
+    }
     _record_entry_history(
         db,
         entry,
@@ -933,6 +950,7 @@ def _create_imported_document(
             "source_table": candidate.source_table,
             "source_attachment_id": candidate.source_attachment_id,
         },
+        snapshot=import_snapshot,
     )
     return entry
 
