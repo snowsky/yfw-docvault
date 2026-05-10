@@ -30,10 +30,12 @@ class StandaloneUser(Base):
 
 def init_db() -> None:
     import backend.models  # noqa: F401
+    from backend.schema import ensure_docvault_schema
 
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
+        ensure_docvault_schema(db)
         user = db.query(StandaloneUser).filter(StandaloneUser.id == 1).first()
         if not user:
             db.add(StandaloneUser(id=1, email="standalone@docvault.local"))
