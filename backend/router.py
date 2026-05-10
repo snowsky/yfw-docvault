@@ -721,13 +721,21 @@ def _host_statement_models():
 
 def _host_document_models():
     try:
-        from core.models.models_per_tenant import Expense, ExpenseAttachment, Invoice, InvoiceAttachment
+        from core.models.models_per_tenant import Expense, ExpenseAttachment, InventoryItem, Invoice, InvoiceAttachment, ItemAttachment
     except ModuleNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail="Attachment import scanning is available only in invoice_app plugin mode",
         )
-    return Invoice, InvoiceAttachment, Expense, ExpenseAttachment
+    return Invoice, InvoiceAttachment, Expense, ExpenseAttachment, InventoryItem, ItemAttachment
+
+
+def _host_portfolio_models():
+    try:
+        from plugins.investments.models import FileAttachment, InvestmentPortfolio
+    except ModuleNotFoundError:
+        return None, None
+    return InvestmentPortfolio, FileAttachment
 
 
 def _current_tenant_id(current_user: MasterUser) -> int | None:
@@ -871,7 +879,7 @@ def _scan_invoice_import_candidates(
 ) -> list[DocVaultImportCandidate]:
     if not payload.include_invoice_attachments:
         return []
-    Invoice, InvoiceAttachment, _, _ = _host_document_models()
+    Invoice, InvoiceAttachment, _, _, _, _ = _host_document_models()
     candidates: list[DocVaultImportCandidate] = []
 
     query = (
@@ -916,7 +924,7 @@ def _scan_expense_import_candidates(
 ) -> list[DocVaultImportCandidate]:
     if not payload.include_expense_attachments:
         return []
-    _, _, Expense, ExpenseAttachment = _host_document_models()
+    _, _, Expense, ExpenseAttachment, _, _ = _host_document_models()
     candidates: list[DocVaultImportCandidate] = []
 
     query = (
@@ -952,6 +960,100 @@ def _scan_expense_import_candidates(
     return candidates
 
 
+def _scan_inventory_import_candidates(
+    db: Session,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_inventory_attachments:
+        return []
+    _, _, _, _, InventoryItem, ItemAttachment = _host_document_models()
+    candidates: list[DocVaultImportCandidate] = []
+
+    query = (
+        db.query(ItemAttachment)
+        .join(InventoryItem, ItemAttachment.item_id == InventoryItem.id)
+        .filter(
+            ItemAttachment.is_active.is_(True),
+            InventoryItem.is_active.is_(True),
+        )
+        .order_by(ItemAttachment.created_at.desc())
+    )
+    attachments = query.all()
+
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "item_attachments", attachment.id)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="inventory",
+                owner_type="inventory",
+                owner_id=attachment.item_id,
+                source_table="item_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.filename or attachment.stored_filename,
+                file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                file_size=attachment.file_size,
+                storage_provider=_storage_provider(attachment.file_path),
+                storage_key=attachment.file_path,
+                checksum_sha256=attachment.file_hash,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
+def _scan_portfolio_import_candidates(
+    db: Session,
+    current_user: MasterUser,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_portfolio_files:
+        return []
+    InvestmentPortfolio, FileAttachment = _host_portfolio_models()
+    if InvestmentPortfolio is None or FileAttachment is None:
+        return []
+
+    tenant_id = _current_tenant_id(current_user)
+    candidates: list[DocVaultImportCandidate] = []
+    query = (
+        db.query(FileAttachment)
+        .join(InvestmentPortfolio, FileAttachment.portfolio_id == InvestmentPortfolio.id)
+        .filter(InvestmentPortfolio.is_archived.is_(False))
+        .order_by(FileAttachment.created_at.desc())
+    )
+    if tenant_id is not None:
+        query = query.filter(FileAttachment.tenant_id == tenant_id)
+
+    attachments = query.all()
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "investment_file_attachments", attachment.id)
+        file_type = getattr(attachment.file_type, "value", attachment.file_type)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="portfolio",
+                owner_type="portfolio",
+                owner_id=attachment.portfolio_id,
+                source_table="investment_file_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.original_filename or attachment.stored_filename,
+                file_mime_type=_infer_mime_type(attachment.original_filename, f"text/{file_type}" if file_type == "csv" else "application/pdf"),
+                file_size=attachment.file_size,
+                storage_provider=_storage_provider(attachment.local_path, attachment.cloud_url),
+                storage_key=attachment.cloud_url or attachment.local_path,
+                checksum_sha256=attachment.file_hash,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
 def _scan_import_candidates(
     db: Session,
     current_user: MasterUser,
@@ -964,6 +1066,10 @@ def _scan_import_candidates(
         candidates.extend(_scan_invoice_import_candidates(db, payload))
     if "expense" in payload.components:
         candidates.extend(_scan_expense_import_candidates(db, payload))
+    if "inventory" in payload.components:
+        candidates.extend(_scan_inventory_import_candidates(db, payload))
+    if "portfolio" in payload.components:
+        candidates.extend(_scan_portfolio_import_candidates(db, current_user, payload))
     if payload.limit is not None:
         candidates = candidates[:payload.limit]
     return candidates

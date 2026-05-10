@@ -221,15 +221,17 @@ class DocVaultAuditPackageResponse(BaseModel):
     manifest: dict[str, Any]
 
 
-DocVaultImportComponent = Literal["bank_statement", "invoice", "expense"]
+DocVaultImportComponent = Literal["bank_statement", "invoice", "expense", "inventory", "portfolio"]
 
 
 class DocVaultImportScanRequest(BaseModel):
-    components: list[DocVaultImportComponent] = Field(default_factory=lambda: ["bank_statement", "invoice", "expense"])
+    components: list[DocVaultImportComponent] = Field(default_factory=lambda: ["bank_statement", "invoice", "expense", "inventory", "portfolio"])
     include_statement_files: bool = True
     include_statement_attachments: bool = True
     include_invoice_attachments: bool = True
     include_expense_attachments: bool = True
+    include_inventory_attachments: bool = True
+    include_portfolio_files: bool = True
     limit: int | None = Field(default=None, ge=1, le=10000)
 
 

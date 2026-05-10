@@ -1066,7 +1066,7 @@ export default function DocVault() {
     try {
       const data = await apiRequest<ImportScanResponse>('/docvault/import/scan', {
         method: 'POST',
-        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense'] }),
+        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense', 'inventory', 'portfolio'] }),
       });
       setImportScan(data);
       toast.success(`Found ${data.summary.importable} document(s) to import`);
@@ -1080,7 +1080,7 @@ export default function DocVault() {
     try {
       const data = await apiRequest<ImportRunResponse>('/docvault/import/run', {
         method: 'POST',
-        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense'], dry_run: false }),
+        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense', 'inventory', 'portfolio'], dry_run: false }),
       });
       setImportScan(data);
       await loadEntries();
@@ -1839,7 +1839,7 @@ export default function DocVault() {
           </DialogHeader>
           <div className="space-y-4">
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
-              Scan bank statement, invoice, and expense attachments, then create DocVault document records for anything not already linked.
+              Scan bank statement, invoice, expense, inventory, and portfolio attachments, then create DocVault document records for anything not already linked.
             </div>
             <div className="grid gap-3 sm:grid-cols-4">
               <div className="rounded-lg border border-slate-200 bg-white p-3">
