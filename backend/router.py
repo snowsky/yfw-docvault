@@ -772,6 +772,10 @@ def _storage_provider(storage_key: str | None, cloud_url: str | None = None) -> 
     return "cloud"
 
 
+def _statement_reference_key(statement_id: int) -> str:
+    return f"docvault://statement/{statement_id}"
+
+
 def _locator_for_source(db: Session, source_table: str, source_attachment_id: int) -> DocVaultAttachmentLocator | None:
     return (
         db.query(DocVaultAttachmentLocator)
@@ -801,8 +805,10 @@ def _scan_bank_statement_import_candidates(
         if payload.limit is not None and len(candidates) >= payload.limit:
             break
 
-        if payload.include_statement_files and getattr(statement, "file_path", None):
+        if payload.include_statement_files:
             locator = _locator_for_source(db, "bank_statements", statement.id)
+            statement_path = getattr(statement, "file_path", None)
+            statement_cloud_url = getattr(statement, "cloud_file_url", None)
             candidates.append(
                 DocVaultImportCandidate(
                     component="bank_statement",
@@ -812,9 +818,9 @@ def _scan_bank_statement_import_candidates(
                     source_attachment_id=statement.id,
                     file_name=statement.original_filename or statement.stored_filename,
                     file_mime_type=_infer_mime_type(statement.original_filename),
-                    file_size=_local_file_size(statement.file_path),
-                    storage_provider="cloud" if statement.cloud_file_url else "local",
-                    storage_key=statement.cloud_file_url or statement.file_path,
+                    file_size=_local_file_size(statement_path),
+                    storage_provider=_storage_provider(statement_path, statement_cloud_url) if statement_path or statement_cloud_url else "reference",
+                    storage_key=statement_cloud_url or statement_path or _statement_reference_key(statement.id),
                     checksum_sha256=statement.file_hash,
                     already_imported=locator is not None,
                     existing_entry_id=locator.entry_id if locator else None,
@@ -980,6 +986,13 @@ def _create_imported_document(
     candidate: DocVaultImportCandidate,
     current_user: MasterUser,
 ) -> DocVaultEntry:
+    source_label = candidate.owner_type.replace("_", " ")
+    import_note = (
+        f"Imported from {source_label} #{candidate.owner_id}"
+        f" ({candidate.source_table} #{candidate.source_attachment_id})."
+    )
+    if candidate.storage_provider == "reference":
+        import_note += " This source record does not have a stored attachment, so DocVault keeps a reference to the original record."
     metadata = _normalize_document_metadata(
         {
             "source_module": candidate.component,
@@ -987,6 +1000,8 @@ def _create_imported_document(
             "source_attachment_id": candidate.source_attachment_id,
             "source_owner_type": candidate.owner_type,
             "source_owner_id": candidate.owner_id,
+            "source_url": f"/statements?id={candidate.owner_id}" if candidate.owner_type == "statement" else None,
+            "import_note": import_note,
             "document_label": "finance",
             "approval_status": "draft",
             "immutable": False,
@@ -1000,6 +1015,7 @@ def _create_imported_document(
         file_size=candidate.file_size,
         public_metadata=metadata,
         sensitive_payload={},
+        notes=import_note,
         tags=["imported", candidate.component],
         created_by=current_user.id,
     )
@@ -1044,7 +1060,7 @@ def _create_imported_document(
         "issue_date": None,
         "public_metadata": dict(metadata),
         "sensitive_payload": {},
-        "notes": None,
+        "notes": import_note,
         "tags": ["imported", candidate.component],
         "thumbnail_data_url": None,
         "file_name": candidate.file_name,

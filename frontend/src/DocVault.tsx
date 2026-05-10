@@ -473,6 +473,17 @@ function documentDetails(entry: DocVaultEntry) {
   };
 }
 
+function sourceRecordUrl(entry: DocVaultEntry) {
+  const metadata = entry.public_metadata || {};
+  if (typeof metadata.source_url === 'string' && metadata.source_url) {
+    return metadata.source_url;
+  }
+  if (metadata.source_owner_type === 'statement' && metadata.source_owner_id) {
+    return `/statements?id=${metadata.source_owner_id}`;
+  }
+  return null;
+}
+
 function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {
   return Boolean(entry.public_metadata?.immutable);
 }
@@ -1639,6 +1650,7 @@ export default function DocVault() {
               {paginated.map((entry) => {
                 const entryConfig = tabConfig.find((tab) => tab.id === entry.category);
                 const EntryIcon = entryConfig?.icon || FileText;
+                const sourceUrl = sourceRecordUrl(entry);
                 return (
                   <Card key={entry.id} id={`entry-${entry.id}`} className="overflow-hidden transition hover:border-blue-200 hover:shadow-md">
                     <CardContent className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
@@ -1697,8 +1709,18 @@ export default function DocVault() {
                       <div className="flex flex-wrap gap-2 md:justify-end">
                         {entry.category === 'document' && (
                           <>
-                            {(entry.file_name || cloudIntegration(entry)) && (
-                              <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
+                            {(entry.file_name || cloudIntegration(entry) || sourceUrl) && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  if (sourceUrl) {
+                                    window.location.assign(sourceUrl);
+                                    return;
+                                  }
+                                  setUnlocking(entry);
+                                }}
+                              >
                                 <ExternalLink className="mr-2 h-4 w-4" />
                                 Open
                               </Button>
