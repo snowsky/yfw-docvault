@@ -1640,7 +1640,7 @@ export default function DocVault() {
                 const entryConfig = tabConfig.find((tab) => tab.id === entry.category);
                 const EntryIcon = entryConfig?.icon || FileText;
                 return (
-                  <Card key={entry.id} className="overflow-hidden transition hover:border-blue-200 hover:shadow-md">
+                  <Card key={entry.id} id={`entry-${entry.id}`} className="overflow-hidden transition hover:border-blue-200 hover:shadow-md">
                     <CardContent className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
                       <div className="flex min-w-0 gap-3">
                         {entry.thumbnail_data_url ? (
@@ -1845,19 +1845,44 @@ export default function DocVault() {
                 </div>
               ) : (
                 <div className="divide-y divide-slate-200">
-                  {(importScan?.candidates || []).slice(0, 25).map((candidate) => (
-                    <div key={`${candidate.source_table}-${candidate.source_attachment_id}`} className="flex items-center justify-between gap-3 p-3 text-sm">
-                      <div className="min-w-0">
-                        <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
-                        <div className="text-xs text-muted-foreground">
-                          Statement #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
+                  {(importScan?.candidates || []).slice(0, 25).map((candidate) => {
+                    const cloudUrl = candidate.storage_provider === 'cloud' && candidate.storage_key?.startsWith('http') ? candidate.storage_key : null;
+                    return (
+                      <div key={`${candidate.source_table}-${candidate.source_attachment_id}`} className="flex items-center justify-between gap-3 p-3 text-sm">
+                        <div className="min-w-0 flex-1">
+                          {cloudUrl ? (
+                            <a
+                              href={cloudUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="flex items-center gap-1 truncate font-medium text-blue-700 hover:underline"
+                            >
+                              <ExternalLink className="h-3 w-3 shrink-0" />
+                              <span className="truncate">{candidate.file_name}</span>
+                            </a>
+                          ) : (
+                            <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
+                          )}
+                          <div className="text-xs text-muted-foreground">
+                            Statement #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
+                          </div>
                         </div>
+                        {candidate.already_imported && candidate.existing_entry_id ? (
+                          <a
+                            href={`#entry-${candidate.existing_entry_id}`}
+                            onClick={() => setImportDialogOpen(false)}
+                            className="shrink-0 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                          >
+                            Linked ↗
+                          </a>
+                        ) : (
+                          <Badge variant="outline" className={candidate.already_imported ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-blue-200 bg-blue-50 text-blue-800'}>
+                            {candidate.already_imported ? 'Linked' : 'Ready'}
+                          </Badge>
+                        )}
                       </div>
-                      <Badge variant="outline" className={candidate.already_imported ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-blue-200 bg-blue-50 text-blue-800'}>
-                        {candidate.already_imported ? 'Linked' : 'Ready'}
-                      </Badge>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {(importScan?.candidates.length || 0) > 25 && (
                     <div className="p-3 text-xs text-muted-foreground">
                       Showing 25 of {importScan?.candidates.length} candidates.
