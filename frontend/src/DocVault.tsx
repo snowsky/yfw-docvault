@@ -1055,10 +1055,10 @@ export default function DocVault() {
     try {
       const data = await apiRequest<ImportScanResponse>('/docvault/import/scan', {
         method: 'POST',
-        body: JSON.stringify({ components: ['bank_statement'] }),
+        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense'] }),
       });
       setImportScan(data);
-      toast.success(`Found ${data.summary.importable} statement document(s) to import`);
+      toast.success(`Found ${data.summary.importable} document(s) to import`);
     } finally {
       setImportBusy(false);
     }
@@ -1069,11 +1069,11 @@ export default function DocVault() {
     try {
       const data = await apiRequest<ImportRunResponse>('/docvault/import/run', {
         method: 'POST',
-        body: JSON.stringify({ components: ['bank_statement'], dry_run: false }),
+        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense'], dry_run: false }),
       });
       setImportScan(data);
       await loadEntries();
-      toast.success(`Imported ${data.summary.imported} statement document(s)`);
+      toast.success(`Imported ${data.summary.imported} document(s)`);
     } finally {
       setImportBusy(false);
     }
@@ -1817,7 +1817,7 @@ export default function DocVault() {
           </DialogHeader>
           <div className="space-y-4">
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
-              Scan bank statement files and statement attachments, then create DocVault document records for anything not already linked.
+              Scan bank statement, invoice, and expense attachments, then create DocVault document records for anything not already linked.
             </div>
             <div className="grid gap-3 sm:grid-cols-4">
               <div className="rounded-lg border border-slate-200 bg-white p-3">
@@ -1841,7 +1841,7 @@ export default function DocVault() {
             <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
               {(importScan?.candidates || []).length === 0 ? (
                 <div className="p-4 text-sm text-muted-foreground">
-                  {importBusy ? 'Scanning statement documents...' : 'No statement documents found yet.'}
+                  {importBusy ? 'Scanning documents...' : 'No importable documents found yet.'}
                 </div>
               ) : (
                 <div className="divide-y divide-slate-200">
@@ -1864,7 +1864,7 @@ export default function DocVault() {
                             <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
                           )}
                           <div className="text-xs text-muted-foreground">
-                            Statement #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
+                            {candidate.owner_type.replace(/_/g, ' ')} #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
                           </div>
                         </div>
                         {candidate.already_imported && candidate.existing_entry_id ? (

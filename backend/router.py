@@ -719,6 +719,17 @@ def _host_statement_models():
     return BankStatement, BankStatementAttachment
 
 
+def _host_document_models():
+    try:
+        from core.models.models_per_tenant import Expense, ExpenseAttachment, Invoice, InvoiceAttachment
+    except ModuleNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Attachment import scanning is available only in invoice_app plugin mode",
+        )
+    return Invoice, InvoiceAttachment, Expense, ExpenseAttachment
+
+
 def _current_tenant_id(current_user: MasterUser) -> int | None:
     try:
         from core.models.database import get_tenant_context
@@ -749,6 +760,16 @@ def _local_file_size(path: str | None) -> int | None:
         return os.path.getsize(path)
     except OSError:
         return None
+
+
+def _storage_provider(storage_key: str | None, cloud_url: str | None = None) -> str:
+    if cloud_url:
+        return "cloud"
+    if not storage_key:
+        return "local"
+    if os.path.isabs(storage_key) or storage_key.startswith("attachments/"):
+        return "local"
+    return "cloud"
 
 
 def _locator_for_source(db: Session, source_table: str, source_attachment_id: int) -> DocVaultAttachmentLocator | None:
@@ -838,6 +859,93 @@ def _scan_bank_statement_import_candidates(
     return candidates
 
 
+def _scan_invoice_import_candidates(
+    db: Session,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_invoice_attachments:
+        return []
+    Invoice, InvoiceAttachment, _, _ = _host_document_models()
+    candidates: list[DocVaultImportCandidate] = []
+
+    query = (
+        db.query(InvoiceAttachment)
+        .join(Invoice, InvoiceAttachment.invoice_id == Invoice.id)
+        .filter(
+            InvoiceAttachment.is_active.is_(True),
+            Invoice.is_deleted.is_(False),
+        )
+        .order_by(InvoiceAttachment.created_at.desc())
+    )
+    attachments = query.all()
+
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "invoice_attachments", attachment.id)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="invoice",
+                owner_type="invoice",
+                owner_id=attachment.invoice_id,
+                source_table="invoice_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.filename or attachment.stored_filename,
+                file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                file_size=attachment.file_size,
+                storage_provider=_storage_provider(attachment.file_path),
+                storage_key=attachment.file_path,
+                checksum_sha256=attachment.file_hash,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
+def _scan_expense_import_candidates(
+    db: Session,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_expense_attachments:
+        return []
+    _, _, Expense, ExpenseAttachment = _host_document_models()
+    candidates: list[DocVaultImportCandidate] = []
+
+    query = (
+        db.query(ExpenseAttachment)
+        .join(Expense, ExpenseAttachment.expense_id == Expense.id)
+        .filter(Expense.is_deleted.is_(False))
+        .order_by(ExpenseAttachment.uploaded_at.desc())
+    )
+    attachments = query.all()
+
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "expense_attachments", attachment.id)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="expense",
+                owner_type="expense",
+                owner_id=attachment.expense_id,
+                source_table="expense_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.filename,
+                file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                file_size=attachment.file_size or _local_file_size(attachment.file_path),
+                storage_provider=_storage_provider(attachment.file_path),
+                storage_key=attachment.file_path,
+                checksum_sha256=None,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
 def _scan_import_candidates(
     db: Session,
     current_user: MasterUser,
@@ -846,6 +954,12 @@ def _scan_import_candidates(
     candidates: list[DocVaultImportCandidate] = []
     if "bank_statement" in payload.components:
         candidates.extend(_scan_bank_statement_import_candidates(db, current_user, payload))
+    if "invoice" in payload.components:
+        candidates.extend(_scan_invoice_import_candidates(db, payload))
+    if "expense" in payload.components:
+        candidates.extend(_scan_expense_import_candidates(db, payload))
+    if payload.limit is not None:
+        candidates = candidates[:payload.limit]
     return candidates
 
 
