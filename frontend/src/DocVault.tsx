@@ -106,6 +106,15 @@ interface AttachmentVersion {
   created_at: string;
 }
 
+interface EntryHistoryEvent {
+  id: number;
+  entry_id: number;
+  action: 'created' | 'updated' | string;
+  changed_fields: string[];
+  details: Record<string, any>;
+  created_at: string;
+}
+
 interface SignatureRecord {
   id: number;
   entry_id: number;
@@ -345,6 +354,32 @@ function fileSize(bytes?: number | null) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function historyFieldLabel(field: string) {
+  const labels: Record<string, string> = {
+    created: 'Created',
+    title: 'Title',
+    owner_name: 'Owner',
+    issuer: 'Issuer',
+    expiry_date: 'Expiry date',
+    issue_date: 'Issue date',
+    public_metadata: 'Metadata',
+    sensitive_payload: 'Sensitive details',
+    notes: 'Private notes',
+    tags: 'Tags',
+    file_name: 'File name',
+    file_mime_type: 'File type',
+    file_size: 'File size',
+    file_data_url: 'File contents',
+  };
+  return labels[field] || field.replace(/_/g, ' ');
+}
+
+function historyActionLabel(event: EntryHistoryEvent) {
+  if (event.action === 'created') return 'Item created';
+  if (event.details?.attachment_changed) return 'Item and attachment updated';
+  return 'Item updated';
 }
 
 function cloudProviderLabel(provider?: string | null) {
@@ -706,6 +741,7 @@ export default function DocVault() {
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
   const [certificateInfo, setCertificateInfo] = React.useState<CertificateInfo | null>(null);
   const [historyEntry, setHistoryEntry] = React.useState<DocVaultEntry | null>(null);
+  const [itemHistory, setItemHistory] = React.useState<EntryHistoryEvent[]>([]);
   const [versions, setVersions] = React.useState<AttachmentVersion[]>([]);
   const [signatureEntry, setSignatureEntry] = React.useState<DocVaultEntry | null>(null);
   const [signatures, setSignatures] = React.useState<SignatureRecord[]>([]);
@@ -878,8 +914,12 @@ export default function DocVault() {
 
   async function loadHistory(entry: DocVaultEntry) {
     setHistoryEntry(entry);
-    const data = await apiRequest<AttachmentVersion[]>(`/docvault/${entry.id}/attachments`);
-    setVersions(data);
+    const [history, attachmentVersions] = await Promise.all([
+      apiRequest<EntryHistoryEvent[]>(`/docvault/${entry.id}/history`),
+      apiRequest<AttachmentVersion[]>(`/docvault/${entry.id}/attachments`),
+    ]);
+    setItemHistory(history);
+    setVersions(attachmentVersions);
   }
 
   async function loadSignatures(entry: DocVaultEntry) {
@@ -1540,10 +1580,6 @@ export default function DocVault() {
                                 Open
                               </Button>
                             )}
-                            <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
-                              <History className="mr-2 h-4 w-4" />
-                              History
-                            </Button>
                             <Button variant="outline" size="sm" onClick={() => loadSignatures(entry).catch((error) => toast.error(error.message || 'Signatures failed'))}>
                               <PenLine className="mr-2 h-4 w-4" />
                               Sign
@@ -1553,6 +1589,10 @@ export default function DocVault() {
                         <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
                           <Lock className="mr-2 h-4 w-4" />
                           Details
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
+                          <History className="mr-2 h-4 w-4" />
+                          History
                         </Button>
                         <ShareButton recordType="docvault_item" recordId={entry.id} />
                         {!isImmutable(entry) && (
@@ -2480,22 +2520,41 @@ export default function DocVault() {
       <Dialog open={!!historyEntry} onOpenChange={(open) => !open && setHistoryEntry(null)}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><History className="h-5 w-5" /> Attachment history</DialogTitle>
+            <DialogTitle className="flex items-center gap-2"><History className="h-5 w-5" /> Item history</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             <div className="font-semibold">{historyEntry?.title}</div>
-            {versions.map((version) => (
-              <div key={version.id} className="rounded-lg border p-3 text-sm">
+            {itemHistory.map((event) => (
+              <div key={event.id} className="rounded-lg border p-3 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="font-medium">v{version.version} · {version.file_name}</div>
-                  {version.is_current && <Badge variant="outline">Current</Badge>}
+                  <div className="font-medium">{historyActionLabel(event)}</div>
+                  <div className="text-xs text-muted-foreground">{new Date(event.created_at).toLocaleString()}</div>
                 </div>
-                <div className="mt-1 text-muted-foreground">{fileSize(version.file_size)} · {new Date(version.created_at).toLocaleString()}</div>
-                <div className="mt-1 font-mono text-xs text-muted-foreground">{version.checksum_sha256}</div>
-                {version.change_note && <div className="mt-2">{version.change_note}</div>}
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {event.changed_fields.map((field) => (
+                    <Badge key={field} variant="outline">{historyFieldLabel(field)}</Badge>
+                  ))}
+                </div>
               </div>
             ))}
-            {versions.length === 0 && <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">No attachment versions yet.</div>}
+            {itemHistory.length === 0 && <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">No item updates recorded yet.</div>}
+            {historyEntry?.category === 'document' && (
+              <div className="space-y-2 pt-2">
+                <div className="text-xs font-semibold uppercase text-muted-foreground">Attachment versions</div>
+                {versions.map((version) => (
+                  <div key={version.id} className="rounded-lg border p-3 text-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-medium">v{version.version} · {version.file_name}</div>
+                      {version.is_current && <Badge variant="outline">Current</Badge>}
+                    </div>
+                    <div className="mt-1 text-muted-foreground">{fileSize(version.file_size)} · {new Date(version.created_at).toLocaleString()}</div>
+                    <div className="mt-1 font-mono text-xs text-muted-foreground">{version.checksum_sha256}</div>
+                    {version.change_note && <div className="mt-2">{version.change_note}</div>}
+                  </div>
+                ))}
+                {versions.length === 0 && <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">No attachment versions yet.</div>}
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>

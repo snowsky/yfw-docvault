@@ -157,6 +157,18 @@ class DocVaultAttachmentVersionResponse(DocVaultAttachmentVersionCreate):
     model_config = {"from_attributes": True}
 
 
+class DocVaultEntryHistoryResponse(BaseModel):
+    id: int
+    entry_id: int
+    action: str
+    changed_fields: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_by: int | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class DocVaultCloudLinkRequest(BaseModel):
     provider: DocVaultCloudProvider
     file_url: str = Field(min_length=1, max_length=2048)

@@ -32,7 +32,7 @@ except ModuleNotFoundError:
     def log_audit_event(**kwargs):
         return None
 
-from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultMFAEnrollment, DocVaultSignature
+from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultEntryHistory, DocVaultMFAEnrollment, DocVaultSignature
 from .schemas import (
     DocVaultAttachmentVersionCreate,
     DocVaultAttachmentVersionResponse,
@@ -41,6 +41,7 @@ from .schemas import (
     DocVaultCloudLinkRequest,
     DocVaultCopyEventRequest,
     DocVaultEntryCreate,
+    DocVaultEntryHistoryResponse,
     DocVaultEntryResponse,
     DocVaultEntryUpdate,
     DocVaultMFAEnrollmentResponse,
@@ -302,6 +303,18 @@ def _version_response(version: DocVaultAttachmentVersion) -> DocVaultAttachmentV
     )
 
 
+def _history_response(history: DocVaultEntryHistory) -> DocVaultEntryHistoryResponse:
+    return DocVaultEntryHistoryResponse(
+        id=history.id,
+        entry_id=history.entry_id,
+        action=history.action,
+        changed_fields=history.changed_fields or [],
+        details=history.details or {},
+        created_by=history.created_by,
+        created_at=history.created_at,
+    )
+
+
 def _signature_response(signature: DocVaultSignature) -> DocVaultSignatureResponse:
     return DocVaultSignatureResponse(
         id=signature.id,
@@ -548,6 +561,26 @@ def _create_attachment_version(
     )
     db.add(version)
     return version
+
+
+def _record_entry_history(
+    db: Session,
+    entry: DocVaultEntry,
+    *,
+    action: str,
+    changed_fields: list[str],
+    user_id: int | None,
+    details: dict[str, Any] | None = None,
+) -> DocVaultEntryHistory:
+    history = DocVaultEntryHistory(
+        entry_id=entry.id,
+        action=action,
+        changed_fields=sorted(set(changed_fields)),
+        details=details or {},
+        created_by=user_id,
+    )
+    db.add(history)
+    return history
 
 
 def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRequest) -> None:
@@ -804,6 +837,14 @@ async def create_entry(
     db.add(entry)
     db.commit()
     db.refresh(entry)
+    _record_entry_history(
+        db,
+        entry,
+        action="created",
+        changed_fields=["created"],
+        user_id=current_user.id,
+        details={"category": entry.category},
+    )
     if entry.category == "document" and (entry.file_name or entry.file_data_url):
         _create_attachment_version(
             db,
@@ -815,6 +856,8 @@ async def create_entry(
             change_note="Initial cloud link" if cloud_integration else "Initial upload",
             user_id=current_user.id,
         )
+        db.commit()
+    else:
         db.commit()
     log_audit_event(
         db=db,
@@ -868,8 +911,8 @@ async def update_entry(
         metadata = dict(entry.public_metadata or {})
         metadata["password_updated_at"] = date.today().isoformat()
         entry.public_metadata = metadata
-    if entry.category == "document" and any(
-        old_document_snapshot.get(key) != getattr(entry, key)
+    changed_fields = [
+        key
         for key in (
             "title",
             "owner_name",
@@ -884,7 +927,17 @@ async def update_entry(
             "file_size",
             "file_data_url",
         )
-    ):
+        if key in incoming and old_document_snapshot.get(key) != getattr(entry, key)
+    ]
+    if incoming_sensitive_payload:
+        changed_fields.append("sensitive_payload")
+    old_cloud = (old_document_snapshot["public_metadata"] or {}).get("cloud_integration")
+    new_cloud = (entry.public_metadata or {}).get("cloud_integration")
+    attachment_changed = entry.category == "document" and any(
+        field in changed_fields for field in ("file_name", "file_mime_type", "file_size", "file_data_url")
+    )
+    cloud_link_changed = entry.category == "document" and old_cloud != new_cloud
+    if attachment_changed or cloud_link_changed:
         _create_attachment_version(
             db,
             entry,
@@ -894,6 +947,18 @@ async def update_entry(
             file_data_url=incoming.get("file_data_url") or entry.file_data_url,
             change_note="Uploaded replacement" if old_document_snapshot["file_data_url"] != entry.file_data_url else "Updated document details",
             user_id=current_user.id,
+        )
+    if changed_fields:
+        _record_entry_history(
+            db,
+            entry,
+            action="updated",
+            changed_fields=changed_fields,
+            user_id=current_user.id,
+            details={
+                "category": entry.category,
+                "attachment_changed": attachment_changed or cloud_link_changed,
+            },
         )
     db.add(entry)
     db.commit()
@@ -993,6 +1058,22 @@ async def list_attachment_versions(
     return [_version_response(version) for version in versions]
 
 
+@router.get("/{entry_id}/history", response_model=list[DocVaultEntryHistoryResponse])
+async def list_entry_history(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    _get_entry_or_404(db, entry_id)
+    history = (
+        db.query(DocVaultEntryHistory)
+        .filter(DocVaultEntryHistory.entry_id == entry_id)
+        .order_by(DocVaultEntryHistory.created_at.desc(), DocVaultEntryHistory.id.desc())
+        .all()
+    )
+    return [_history_response(item) for item in history]
+
+
 @router.post("/{entry_id}/attachments", response_model=DocVaultAttachmentVersionResponse, status_code=status.HTTP_201_CREATED)
 async def create_attachment_version(
     entry_id: int,
@@ -1018,6 +1099,14 @@ async def create_attachment_version(
         user_id=current_user.id,
     )
     db.add(entry)
+    _record_entry_history(
+        db,
+        entry,
+        action="updated",
+        changed_fields=["file_name", "file_mime_type", "file_size", "file_data_url"],
+        user_id=current_user.id,
+        details={"category": entry.category, "attachment_changed": True},
+    )
     db.commit()
     db.refresh(version)
     log_audit_event(
@@ -1060,6 +1149,14 @@ async def link_cloud_document(
         user_id=current_user.id,
     )
     db.add(entry)
+    _record_entry_history(
+        db,
+        entry,
+        action="updated",
+        changed_fields=["public_metadata", "file_name", "file_mime_type", "file_data_url"],
+        user_id=current_user.id,
+        details={"category": entry.category, "attachment_changed": True},
+    )
     db.commit()
     db.refresh(entry)
     log_audit_event(
