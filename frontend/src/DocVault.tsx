@@ -17,6 +17,7 @@ import {
   PackageCheck,
   PenLine,
   Plus,
+  RotateCcw,
   Search,
   Settings,
   ShieldCheck,
@@ -112,6 +113,7 @@ interface EntryHistoryEvent {
   action: 'created' | 'updated' | string;
   changed_fields: string[];
   details: Record<string, any>;
+  restorable: boolean;
   created_at: string;
 }
 
@@ -920,6 +922,32 @@ export default function DocVault() {
     ]);
     setItemHistory(history);
     setVersions(attachmentVersions);
+  }
+
+  async function restoreItemHistory(event: EntryHistoryEvent) {
+    if (!historyEntry) return;
+    const confirmed = window.confirm(`Restore "${historyEntry.title}" to the ${new Date(event.created_at).toLocaleString()} version?`);
+    if (!confirmed) return;
+    const data = await apiRequest<{ entry: DocVaultEntry }>(`/docvault/${historyEntry.id}/history/${event.id}/restore`, {
+      method: 'POST',
+    });
+    if (unlocked?.id === historyEntry.id) setUnlocked(null);
+    await loadEntries();
+    await loadHistory(data.entry);
+    toast.success('Item restored');
+  }
+
+  async function restoreAttachmentVersion(version: AttachmentVersion) {
+    if (!historyEntry) return;
+    const confirmed = window.confirm(`Restore "${historyEntry.title}" to attachment v${version.version}?`);
+    if (!confirmed) return;
+    const data = await apiRequest<{ entry: DocVaultEntry }>(`/docvault/${historyEntry.id}/attachments/${version.id}/restore`, {
+      method: 'POST',
+    });
+    if (unlocked?.id === historyEntry.id) setUnlocked(null);
+    await loadEntries();
+    await loadHistory(data.entry);
+    toast.success(`Restored attachment v${version.version}`);
   }
 
   async function loadSignatures(entry: DocVaultEntry) {
@@ -2528,7 +2556,19 @@ export default function DocVault() {
               <div key={event.id} className="rounded-lg border p-3 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="font-medium">{historyActionLabel(event)}</div>
-                  <div className="text-xs text-muted-foreground">{new Date(event.created_at).toLocaleString()}</div>
+                  <div className="flex items-center gap-2">
+                    <div className="text-xs text-muted-foreground">{new Date(event.created_at).toLocaleString()}</div>
+                    {event.restorable && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => restoreItemHistory(event).catch((error) => toast.error(error.message || 'Restore failed'))}
+                      >
+                        <RotateCcw className="h-4 w-4" />
+                        Restore
+                      </Button>
+                    )}
+                  </div>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {event.changed_fields.map((field) => (
@@ -2545,7 +2585,20 @@ export default function DocVault() {
                   <div key={version.id} className="rounded-lg border p-3 text-sm">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="font-medium">v{version.version} · {version.file_name}</div>
-                      {version.is_current && <Badge variant="outline">Current</Badge>}
+                      <div className="flex items-center gap-2">
+                        {version.is_current ? (
+                          <Badge variant="outline">Current</Badge>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => restoreAttachmentVersion(version).catch((error) => toast.error(error.message || 'Restore failed'))}
+                          >
+                            <RotateCcw className="h-4 w-4" />
+                            Restore
+                          </Button>
+                        )}
+                      </div>
                     </div>
                     <div className="mt-1 text-muted-foreground">{fileSize(version.file_size)} · {new Date(version.created_at).toLocaleString()}</div>
                     <div className="mt-1 font-mono text-xs text-muted-foreground">{version.checksum_sha256}</div>

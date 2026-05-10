@@ -163,10 +163,16 @@ class DocVaultEntryHistoryResponse(BaseModel):
     action: str
     changed_fields: list[str] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
+    restorable: bool = False
     created_by: int | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DocVaultRestoreResponse(BaseModel):
+    entry: DocVaultEntryResponse
+    restored_from: dict[str, Any]
 
 
 class DocVaultCloudLinkRequest(BaseModel):
