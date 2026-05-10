@@ -419,6 +419,25 @@ function approvalStatusTone(status: ApprovalStatus) {
   return 'border-slate-200 bg-slate-50 text-slate-700';
 }
 
+function documentDetails(entry: DocVaultEntry) {
+  const cloud = cloudIntegration(entry);
+  return {
+    title: entry.title,
+    file_name: entry.file_name,
+    file_type: entry.file_mime_type,
+    file_size: entry.file_size != null ? fileSize(entry.file_size) : null,
+    classification: documentLabelText(documentLabel(entry)),
+    approval_status: approvalStatusText(approvalStatus(entry)),
+    retention_years: entry.public_metadata?.retention_years ?? null,
+    retention_start_date: entry.public_metadata?.retention_start_date ?? null,
+    cloud_provider: cloud ? cloudProviderLabel(cloud.provider) : null,
+    cloud_file_name: cloud?.file_name ?? null,
+    cloud_file_id: cloud?.file_id ?? null,
+    cloud_file_url: cloud?.file_url ?? null,
+    local_file_available: Boolean(entry.file_data_url),
+  };
+}
+
 function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {
   return Boolean(entry.public_metadata?.immutable);
 }
@@ -2518,6 +2537,8 @@ export default function DocVault() {
                   ))}
                   <div className="text-xs text-muted-foreground">Copied values are cleared from the clipboard after 30 seconds when browser permissions allow it.</div>
                 </div>
+              ) : unlocked.category === 'document' ? (
+                <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(documentDetails(unlocked), null, 2)}</pre>
               ) : (
                 <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(unlocked.sensitive_payload, null, 2)}</pre>
               )}
@@ -2532,7 +2553,8 @@ export default function DocVault() {
                 <Button
                   variant="outline"
                   onClick={() => {
-                    navigator.clipboard.writeText(JSON.stringify(unlocked.sensitive_payload, null, 2));
+                    const details = unlocked.category === 'document' ? documentDetails(unlocked) : unlocked.sensitive_payload;
+                    navigator.clipboard.writeText(JSON.stringify(details, null, 2));
                     toast.success('Copied vault details');
                   }}
                 >
