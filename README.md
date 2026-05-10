@@ -14,6 +14,8 @@ DocVault is a document and expiry manager for YourFinanceWORKS. It can run as a 
 - Retention policy automation with archive runs
 - Audit-ready package generation for external auditors
 
+See [DocVault Feature Roadmap](docs/feature-roadmap.md) for the planned password-manager and document-manager enhancements.
+
 ## Folder Layout
 
 ```text

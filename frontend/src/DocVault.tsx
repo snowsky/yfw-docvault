@@ -39,6 +39,8 @@ import { apiRequest } from '@/lib/api';
 type Category = 'credit_card' | 'ssl_certificate' | 'id_card' | 'document' | 'secret';
 type ExpiryStatus = 'expired' | 'expiring_soon' | 'valid';
 type DocumentSource = 'local' | 'google_drive' | 'onedrive';
+type DocumentLabel = 'unclassified' | 'confidential' | 'finance' | 'legal' | 'hr' | 'identity' | 'tax' | 'vendor' | 'audit';
+type ApprovalStatus = 'draft' | 'review_requested' | 'approved' | 'rejected' | 'needs_changes';
 type UnlockMethod = 'mfa_google' | 'mfa_microsoft' | 'vault_password' | 'recovery_code' | 'local_confirmation';
 
 interface UnlockSettings {
@@ -184,8 +186,11 @@ const emptyForm = {
   username: '',
   login_url: '',
   rotation_interval_days: '180',
+  immutable: false,
   retention_years: '',
   document_source: 'local' as DocumentSource,
+  document_label: 'unclassified' as DocumentLabel,
+  approval_status: 'draft' as ApprovalStatus,
   cloud_url: '',
   cloud_file_id: '',
   cloud_file_name: '',
@@ -213,6 +218,26 @@ const unlockMethods: Array<{ id: UnlockMethod; label: string; factorId: string; 
   { id: 'vault_password', label: 'Vault password', factorId: 'vault_password', inputLabel: 'Vault password', placeholder: 'Enter vault password', inputType: 'password' },
   { id: 'recovery_code', label: 'Recovery code', factorId: 'recovery_code', inputLabel: 'Recovery code', placeholder: 'Enter recovery code' },
   { id: 'local_confirmation', label: 'Local confirmation', factorId: 'local_fallback', inputLabel: 'Confirmation', placeholder: 'Type UNLOCK' },
+];
+
+const documentLabels: Array<{ id: DocumentLabel; label: string }> = [
+  { id: 'unclassified', label: 'Unclassified' },
+  { id: 'confidential', label: 'Confidential' },
+  { id: 'finance', label: 'Finance' },
+  { id: 'legal', label: 'Legal' },
+  { id: 'hr', label: 'HR' },
+  { id: 'identity', label: 'Identity' },
+  { id: 'tax', label: 'Tax' },
+  { id: 'vendor', label: 'Vendor' },
+  { id: 'audit', label: 'Audit' },
+];
+
+const approvalStatuses: Array<{ id: ApprovalStatus; label: string }> = [
+  { id: 'draft', label: 'Draft' },
+  { id: 'review_requested', label: 'Review requested' },
+  { id: 'approved', label: 'Approved' },
+  { id: 'rejected', label: 'Rejected' },
+  { id: 'needs_changes', label: 'Needs changes' },
 ];
 
 const defaultUnlockSettings: UnlockSettings = {
@@ -331,6 +356,33 @@ function cloudIntegration(entry: Pick<DocVaultEntry, 'public_metadata'>) {
   return entry.public_metadata?.cloud_integration as
     | { provider?: DocumentSource; provider_label?: string; file_url?: string; file_id?: string; file_name?: string }
     | undefined;
+}
+
+function documentLabel(entry: Pick<DocVaultEntry, 'public_metadata'>): DocumentLabel {
+  return (entry.public_metadata?.document_label || 'unclassified') as DocumentLabel;
+}
+
+function approvalStatus(entry: Pick<DocVaultEntry, 'public_metadata'>): ApprovalStatus {
+  return (entry.public_metadata?.approval_status || 'draft') as ApprovalStatus;
+}
+
+function documentLabelText(label: DocumentLabel) {
+  return documentLabels.find((item) => item.id === label)?.label || 'Unclassified';
+}
+
+function approvalStatusText(status: ApprovalStatus) {
+  return approvalStatuses.find((item) => item.id === status)?.label || 'Draft';
+}
+
+function approvalStatusTone(status: ApprovalStatus) {
+  if (status === 'approved') return 'border-emerald-200 bg-emerald-50 text-emerald-800';
+  if (status === 'rejected') return 'border-red-200 bg-red-50 text-red-800';
+  if (status === 'review_requested' || status === 'needs_changes') return 'border-yellow-200 bg-yellow-50 text-yellow-900';
+  return 'border-slate-200 bg-slate-50 text-slate-700';
+}
+
+function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {
+  return Boolean(entry.public_metadata?.immutable);
 }
 
 function readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {
@@ -682,6 +734,13 @@ export default function DocVault() {
     atRisk: entries.filter((entry) => entry.secret_health?.status === 'at_risk').length,
     needsReview: entries.filter((entry) => entry.secret_health?.status === 'needs_review').length,
   };
+  const documentSummary = {
+    total: entries.filter((entry) => entry.category === 'document').length,
+    unclassified: entries.filter((entry) => entry.category === 'document' && documentLabel(entry) === 'unclassified').length,
+    pendingApproval: entries.filter((entry) => (
+      entry.category === 'document' && ['review_requested', 'needs_changes'].includes(approvalStatus(entry))
+    )).length,
+  };
   const activeTabConfig = tabConfig.find((tab) => tab.id === activeTab) || tabConfig[0];
   const selectedUnlockMethod = unlockMethods.find((method) => method.id === unlockMethod) || unlockMethods[0];
   const usesSystemMfa = Boolean(systemMfaStatus?.available && systemMfaStatus.configured);
@@ -948,6 +1007,7 @@ export default function DocVault() {
     let title = form.title.trim();
     let issuer = form.issuer.trim();
     let expiryDate = form.expiry_date || null;
+    metadata.immutable = form.immutable;
 
     if (activeTab === 'credit_card') {
       metadata.network = form.network;
@@ -973,6 +1033,10 @@ export default function DocVault() {
     }
     if (activeTab === 'id_card') metadata.card_type = form.card_type;
     if (activeTab === 'document') {
+      if (form.document_label !== 'unclassified') {
+        metadata.document_label = form.document_label;
+      }
+      metadata.approval_status = form.approval_status;
       if (form.retention_years) {
         metadata.retention_years = Number(form.retention_years);
         metadata.retention_start_date = new Date().toISOString().slice(0, 10);
@@ -1212,7 +1276,7 @@ export default function DocVault() {
           </div>
         </div>
 
-        <div className="grid gap-3 md:grid-cols-5">
+        <div className="grid gap-3 md:grid-cols-6">
           <div className="rounded-lg border border-slate-200 bg-white p-4 text-slate-900 shadow-sm">
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs font-semibold uppercase text-slate-500">Total items</div>
@@ -1248,6 +1312,14 @@ export default function DocVault() {
             </div>
             <div className="mt-2 text-3xl font-bold">{secretSummary.atRisk}</div>
             <div className="mt-1 text-xs text-slate-500">{secretSummary.needsReview} need review</div>
+          </div>
+          <div className={`rounded-lg border p-4 shadow-sm ${documentSummary.pendingApproval ? 'border-yellow-200 bg-white text-yellow-900' : 'border-slate-200 bg-white text-slate-900'}`}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase">Document Review</div>
+              <PenLine className="h-4 w-4" />
+            </div>
+            <div className="mt-2 text-3xl font-bold">{documentSummary.pendingApproval}</div>
+            <div className="mt-1 text-xs text-slate-500">{documentSummary.unclassified} unclassified</div>
           </div>
         </div>
 
@@ -1305,6 +1377,7 @@ export default function DocVault() {
                           <div className="flex flex-wrap items-center gap-2">
                             <h3 className="truncate font-semibold">{entry.title}</h3>
                             <Badge variant="outline">{entryConfig?.singularLabel || 'Item'}</Badge>
+                            {isImmutable(entry) && <Badge variant="outline" className="border-slate-300 bg-slate-100 text-slate-800">Immutable</Badge>}
                             <StatusBadge status={entry.expiry_status} days={entry.days_delta} />
                           </div>
                           <div className="mt-1 text-sm text-muted-foreground">
@@ -1324,6 +1397,14 @@ export default function DocVault() {
                               <Badge variant="outline" className={secretHealthTone(entry.secret_health.status)}>
                                 {secretHealthLabel(entry.secret_health)}
                               </Badge>
+                            )}
+                            {entry.category === 'document' && (
+                              <>
+                                <Badge variant="outline">{documentLabelText(documentLabel(entry))}</Badge>
+                                <Badge variant="outline" className={approvalStatusTone(approvalStatus(entry))}>
+                                  {approvalStatusText(approvalStatus(entry))}
+                                </Badge>
+                              </>
                             )}
                             {cloudIntegration(entry) && (
                               <Badge variant="outline" className="gap-1">
@@ -1359,7 +1440,13 @@ export default function DocVault() {
                           <Lock className="mr-2 h-4 w-4" />
                           Details
                         </Button>
-                        <Button variant="ghost" size="icon" aria-label={`Delete ${entry.title}`} onClick={() => setPendingDelete(entry)}>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label={isImmutable(entry) ? `${entry.title} is immutable` : `Delete ${entry.title}`}
+                          disabled={isImmutable(entry)}
+                          onClick={() => setPendingDelete(entry)}
+                        >
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>
@@ -1415,13 +1502,18 @@ export default function DocVault() {
             <p className="text-sm text-slate-600">
               Delete <span className="font-semibold text-slate-900">{pendingDelete?.title}</span> from DocVault? This action cannot be undone.
             </p>
+            {pendingDelete && isImmutable(pendingDelete) && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                This item is immutable and cannot be deleted.
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <Button variant="outline" type="button" disabled={deleteBusy} onClick={() => setPendingDelete(null)}>
                 Cancel
               </Button>
               <Button
                 type="button"
-                disabled={deleteBusy}
+                disabled={deleteBusy || Boolean(pendingDelete && isImmutable(pendingDelete))}
                 className="border-red-600 bg-red-600 hover:border-red-700 hover:bg-red-700"
                 onClick={() => confirmDeleteEntry()}
               >
@@ -1645,6 +1737,36 @@ export default function DocVault() {
 
                 {activeTab === 'document' && (
                   <div className="space-y-3">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label>Classification label</Label>
+                        <Select
+                          value={form.document_label}
+                          onValueChange={(document_label) => setForm({ ...form, document_label: document_label as DocumentLabel })}
+                        >
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            {documentLabels.map((label) => (
+                              <SelectItem key={label.id} value={label.id}>{label.label}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label>Approval status</Label>
+                        <Select
+                          value={form.approval_status}
+                          onValueChange={(approval_status) => setForm({ ...form, approval_status: approval_status as ApprovalStatus })}
+                        >
+                          <SelectTrigger><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            {approvalStatuses.map((approval) => (
+                              <SelectItem key={approval.id} value={approval.id}>{approval.label}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
                     <div className="space-y-1.5">
                       <Label>Document source</Label>
                       <Select
@@ -1744,6 +1866,18 @@ export default function DocVault() {
                     <div className="text-muted-foreground">{activeTabConfig.singularLabel}</div>
                   </div>
                 </div>
+                <label className="flex items-start gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
+                  <input
+                    type="checkbox"
+                    className="mt-1 h-4 w-4"
+                    checked={form.immutable}
+                    onChange={(event) => setForm({ ...form, immutable: event.target.checked })}
+                  />
+                  <span>
+                    <span className="block font-semibold text-slate-900">Make this item immutable</span>
+                    <span className="block text-muted-foreground">After saving, this item cannot be edited, archived, relinked, or replaced.</span>
+                  </span>
+                </label>
                 <div className="space-y-1.5">
                   <Label>Notes</Label>
                   <Textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />

@@ -58,6 +58,17 @@ from .schemas import (
 
 router = APIRouter()
 
+DOCUMENT_LABELS = {"unclassified", "confidential", "finance", "legal", "hr", "identity", "tax", "vendor", "audit"}
+DOCUMENT_APPROVAL_STATUSES = {"draft", "review_requested", "approved", "rejected", "needs_changes"}
+
+
+def _metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
 
 def _warning_days(category: str) -> int:
     return 60 if category == "credit_card" else 30
@@ -239,6 +250,37 @@ def _normalize_cloud_link(payload: DocVaultCloudLinkRequest) -> dict[str, Any]:
         "file_id": payload.file_id,
         "file_name": payload.file_name,
         "linked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _normalize_document_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(metadata)
+    label = normalized.get("document_label")
+    approval_status = normalized.get("approval_status")
+    if label and label not in DOCUMENT_LABELS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown document label")
+    if approval_status and approval_status not in DOCUMENT_APPROVAL_STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown approval status")
+    normalized["approval_status"] = approval_status or "draft"
+    return normalized
+
+
+def _is_immutable(entry: DocVaultEntry) -> bool:
+    return bool((entry.public_metadata or {}).get("immutable"))
+
+
+def _ensure_mutable(entry: DocVaultEntry) -> None:
+    if _is_immutable(entry):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This DocVault item is immutable")
+
+
+def _document_workflow(entry: DocVaultEntry) -> dict[str, Any] | None:
+    if entry.category != "document":
+        return None
+    metadata = dict(entry.public_metadata or {})
+    return {
+        "document_label": metadata.get("document_label"),
+        "approval_status": metadata.get("approval_status") or "draft",
     }
 
 
@@ -730,26 +772,32 @@ async def create_entry(
 ):
     values = payload.model_dump()
     metadata = dict(values.get("public_metadata") or {})
+    metadata["immutable"] = _metadata_bool(metadata.get("immutable"))
     cloud_integration = metadata.get("cloud_integration")
-    if values.get("category") == "document" and cloud_integration:
-        if cloud_integration.get("provider") not in {"google_drive", "onedrive"} or not cloud_integration.get("file_url"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cloud document links require google_drive or onedrive and file_url")
-        cloud_payload = DocVaultCloudLinkRequest(
-            provider=cloud_integration.get("provider"),
-            file_url=cloud_integration.get("file_url"),
-            file_id=cloud_integration.get("file_id"),
-            file_name=cloud_integration.get("file_name") or values.get("file_name"),
-            file_mime_type=values.get("file_mime_type"),
-        )
-        metadata["cloud_integration"] = _normalize_cloud_link(cloud_payload)
+    if values.get("category") == "document":
+        metadata = _normalize_document_metadata(metadata)
+        if cloud_integration:
+            if cloud_integration.get("provider") not in {"google_drive", "onedrive"} or not cloud_integration.get("file_url"):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cloud document links require google_drive or onedrive and file_url")
+            cloud_payload = DocVaultCloudLinkRequest(
+                provider=cloud_integration.get("provider"),
+                file_url=cloud_integration.get("file_url"),
+                file_id=cloud_integration.get("file_id"),
+                file_name=cloud_integration.get("file_name") or values.get("file_name"),
+                file_mime_type=values.get("file_mime_type"),
+            )
+            metadata["cloud_integration"] = _normalize_cloud_link(cloud_payload)
+            values["file_name"] = values.get("file_name") or cloud_payload.file_name or _provider_label(cloud_payload.provider)
+            values["file_data_url"] = None
         values["public_metadata"] = metadata
-        values["file_name"] = values.get("file_name") or cloud_payload.file_name or _provider_label(cloud_payload.provider)
-        values["file_data_url"] = None
     if values.get("category") == "secret":
         metadata = dict(values.get("public_metadata") or {})
+        metadata["immutable"] = _metadata_bool(metadata.get("immutable"))
         payload = dict(values.get("sensitive_payload") or {})
         if payload.get("password") and not metadata.get("password_updated_at"):
             metadata["password_updated_at"] = date.today().isoformat()
+        values["public_metadata"] = metadata
+    if values.get("category") not in {"document", "secret"}:
         values["public_metadata"] = metadata
     entry = DocVaultEntry(**values, created_by=current_user.id)
     db.add(entry)
@@ -788,10 +836,13 @@ async def update_entry(
     current_user: MasterUser = Depends(get_current_user),
 ):
     entry = _get_entry_or_404(db, entry_id)
+    _ensure_mutable(entry)
     old_file_data_url = entry.file_data_url
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(entry, key, value)
     incoming = payload.model_dump(exclude_unset=True)
+    if entry.category == "document" and "public_metadata" in incoming:
+        entry.public_metadata = _normalize_document_metadata(dict(entry.public_metadata or {}))
     if entry.category == "document" and "file_data_url" in incoming and incoming.get("file_data_url") != old_file_data_url:
         _create_attachment_version(
             db,
@@ -826,6 +877,7 @@ async def delete_entry(
     current_user: MasterUser = Depends(get_current_user),
 ):
     entry = _get_entry_or_404(db, entry_id)
+    _ensure_mutable(entry)
     entry.is_archived = True
     db.add(entry)
     db.commit()
@@ -888,6 +940,7 @@ async def create_attachment_version(
     current_user: MasterUser = Depends(get_current_user),
 ):
     entry = _get_entry_or_404(db, entry_id)
+    _ensure_mutable(entry)
     entry.category = "document"
     entry.file_name = payload.file_name
     entry.file_mime_type = payload.file_mime_type
@@ -927,10 +980,11 @@ async def link_cloud_document(
     current_user: MasterUser = Depends(get_current_user),
 ):
     entry = _get_entry_or_404(db, entry_id)
+    _ensure_mutable(entry)
     metadata = dict(entry.public_metadata or {})
     metadata["cloud_integration"] = _normalize_cloud_link(payload)
     entry.category = "document"
-    entry.public_metadata = metadata
+    entry.public_metadata = _normalize_document_metadata(metadata)
     entry.file_name = payload.file_name or entry.file_name or _provider_label(payload.provider)
     entry.file_mime_type = payload.file_mime_type or entry.file_mime_type
     entry.file_data_url = None
@@ -1036,6 +1090,8 @@ async def run_retention_policies(
         years = metadata.get("retention_years")
         if not years:
             continue
+        if _is_immutable(entry):
+            continue
         try:
             years_int = int(years)
         except (TypeError, ValueError):
@@ -1097,6 +1153,7 @@ async def create_audit_package(
             serialized.pop("file_data_url", None)
         package_entries.append({
             "entry": serialized,
+            "document_workflow": _document_workflow(entry),
             "versions": [
                 {
                     **_version_response(version).model_dump(mode="json"),
