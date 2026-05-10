@@ -88,6 +88,92 @@ def _mask_entry_payload(category: str, payload: dict[str, Any] | None) -> dict[s
     return payload
 
 
+def _password_fingerprint(password: str | None) -> str | None:
+    if not password:
+        return None
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _password_score(password: str | None) -> int:
+    if not password:
+        return 0
+    score = 0
+    length = len(password)
+    if length >= 8:
+        score += 20
+    if length >= 12:
+        score += 20
+    if length >= 16:
+        score += 15
+    if re.search(r"[a-z]", password) and re.search(r"[A-Z]", password):
+        score += 15
+    if re.search(r"\d", password):
+        score += 10
+    if re.search(r"[^A-Za-z0-9]", password):
+        score += 15
+    if len(set(password)) >= min(8, length):
+        score += 5
+    if re.fullmatch(r"[A-Za-z]+", password or "") or re.fullmatch(r"\d+", password or ""):
+        score -= 20
+    return max(0, min(score, 100))
+
+
+def _secret_health(entry: DocVaultEntry, *, reused_password: bool = False) -> dict[str, Any] | None:
+    if entry.category != "secret":
+        return None
+
+    metadata = dict(entry.public_metadata or {})
+    payload = dict(entry.sensitive_payload or {})
+    password = str(payload.get("password") or "")
+    score = _password_score(password)
+    issues: list[dict[str, str]] = []
+
+    if not password:
+        issues.append({"id": "missing_password", "label": "Missing password", "severity": "high"})
+    elif score < 60:
+        issues.append({"id": "weak_password", "label": "Weak password", "severity": "high"})
+    elif score < 80:
+        issues.append({"id": "could_be_stronger", "label": "Could be stronger", "severity": "medium"})
+
+    if password and reused_password:
+        issues.append({"id": "reused_password", "label": "Reused password", "severity": "high"})
+
+    password_updated_at = metadata.get("password_updated_at")
+    rotation_days = int(metadata.get("rotation_interval_days") or 180)
+    days_since_rotation = None
+    if password_updated_at:
+        try:
+            updated = date.fromisoformat(str(password_updated_at)[:10])
+            days_since_rotation = (date.today() - updated).days
+            if days_since_rotation > rotation_days:
+                issues.append({"id": "rotation_overdue", "label": "Rotation overdue", "severity": "medium"})
+        except ValueError:
+            issues.append({"id": "rotation_unknown", "label": "Rotation date invalid", "severity": "medium"})
+    elif password:
+        issues.append({"id": "rotation_unknown", "label": "Rotation date missing", "severity": "low"})
+
+    if not metadata.get("username"):
+        issues.append({"id": "missing_username", "label": "Missing username", "severity": "low"})
+    if not metadata.get("login_url"):
+        issues.append({"id": "missing_login_url", "label": "Missing login URL", "severity": "low"})
+
+    high_count = sum(1 for issue in issues if issue["severity"] == "high")
+    medium_count = sum(1 for issue in issues if issue["severity"] == "medium")
+    status_name = "healthy"
+    if high_count:
+        status_name = "at_risk"
+    elif medium_count:
+        status_name = "needs_review"
+
+    return {
+        "score": score,
+        "status": status_name,
+        "issues": issues,
+        "days_since_rotation": days_since_rotation,
+        "rotation_interval_days": rotation_days,
+    }
+
+
 def _checksum(data: str | None) -> str:
     return hashlib.sha256((data or "").encode("utf-8")).hexdigest()
 
@@ -213,7 +299,7 @@ def _has_sensitive_material(entry: DocVaultEntry) -> bool:
     )
 
 
-def _serialize(entry: DocVaultEntry, reveal: bool = False) -> DocVaultEntryResponse:
+def _serialize(entry: DocVaultEntry, reveal: bool = False, reused_password: bool = False) -> DocVaultEntryResponse:
     status_name, days_delta, alerting = _expiry_status(entry.category, entry.expiry_date)
     payload = dict(entry.sensitive_payload or {}) if reveal else _mask_entry_payload(entry.category, entry.sensitive_payload)
     return DocVaultEntryResponse(
@@ -241,13 +327,35 @@ def _serialize(entry: DocVaultEntry, reveal: bool = False) -> DocVaultEntryRespo
         days_delta=days_delta,
         alerting=alerting,
         sensitive_available=_has_sensitive_material(entry),
+        secret_health=_secret_health(entry, reused_password=reused_password),
         attachment_versions_count=0,
         signatures_count=0,
     )
 
 
-def _serialize_with_counts(db: Session, entry: DocVaultEntry, reveal: bool = False) -> DocVaultEntryResponse:
-    response = _serialize(entry, reveal=reveal)
+def _password_reuse_counts(entries: list[DocVaultEntry]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if entry.category != "secret":
+            continue
+        fingerprint = _password_fingerprint((entry.sensitive_payload or {}).get("password"))
+        if fingerprint:
+            counts[fingerprint] = counts.get(fingerprint, 0) + 1
+    return counts
+
+
+def _is_reused_secret(entry: DocVaultEntry, fingerprint_counts: dict[str, int] | None = None) -> bool:
+    fingerprint = _password_fingerprint((entry.sensitive_payload or {}).get("password") if entry.category == "secret" else None)
+    return bool(fingerprint and (fingerprint_counts or {}).get(fingerprint, 0) > 1)
+
+
+def _serialize_with_counts(
+    db: Session,
+    entry: DocVaultEntry,
+    reveal: bool = False,
+    fingerprint_counts: dict[str, int] | None = None,
+) -> DocVaultEntryResponse:
+    response = _serialize(entry, reveal=reveal, reused_password=_is_reused_secret(entry, fingerprint_counts))
     response.attachment_versions_count = db.query(DocVaultAttachmentVersion).filter(
         DocVaultAttachmentVersion.entry_id == entry.id
     ).count()
@@ -466,7 +574,8 @@ async def list_entries(
         entries = [entry for entry in entries if needle in (entry.title or "").lower() or needle in (entry.file_name or "").lower()]
     if tag:
         entries = [entry for entry in entries if tag in (entry.tags or [])]
-    return [_serialize_with_counts(db, entry) for entry in sorted(entries, key=_sort_key)]
+    fingerprint_counts = _password_reuse_counts(entries)
+    return [_serialize_with_counts(db, entry, fingerprint_counts=fingerprint_counts) for entry in sorted(entries, key=_sort_key)]
 
 
 @router.get("/mfa/status", response_model=DocVaultSystemMFAStatusResponse)
@@ -636,6 +745,12 @@ async def create_entry(
         values["public_metadata"] = metadata
         values["file_name"] = values.get("file_name") or cloud_payload.file_name or _provider_label(cloud_payload.provider)
         values["file_data_url"] = None
+    if values.get("category") == "secret":
+        metadata = dict(values.get("public_metadata") or {})
+        payload = dict(values.get("sensitive_payload") or {})
+        if payload.get("password") and not metadata.get("password_updated_at"):
+            metadata["password_updated_at"] = date.today().isoformat()
+        values["public_metadata"] = metadata
     entry = DocVaultEntry(**values, created_by=current_user.id)
     db.add(entry)
     db.commit()

@@ -58,6 +58,7 @@ class DocVaultEntryResponse(DocVaultEntryBase):
     days_delta: int | None = None
     alerting: bool = False
     sensitive_available: bool = False
+    secret_health: dict[str, Any] | None = None
     attachment_versions_count: int = 0
     signatures_count: int = 0
 

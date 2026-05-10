@@ -70,9 +70,24 @@ interface DocVaultEntry {
   days_delta?: number | null;
   alerting: boolean;
   sensitive_available: boolean;
+  secret_health?: SecretHealth | null;
   attachment_versions_count: number;
   signatures_count: number;
   created_at: string;
+}
+
+interface SecretHealthIssue {
+  id: string;
+  label: string;
+  severity: 'high' | 'medium' | 'low';
+}
+
+interface SecretHealth {
+  score: number;
+  status: 'healthy' | 'needs_review' | 'at_risk';
+  issues: SecretHealthIssue[];
+  days_since_rotation?: number | null;
+  rotation_interval_days: number;
 }
 
 interface AttachmentVersion {
@@ -166,6 +181,9 @@ const emptyForm = {
   issuing_authority: '',
   password: '',
   private_key: '',
+  username: '',
+  login_url: '',
+  rotation_interval_days: '180',
   retention_years: '',
   document_source: 'local' as DocumentSource,
   cloud_url: '',
@@ -251,6 +269,40 @@ function StatusBadge({ status, days }: { status: ExpiryStatus; days: number | nu
       ? 'bg-yellow-100 text-yellow-800 border-yellow-200'
       : 'bg-emerald-100 text-emerald-700 border-emerald-200';
   return <Badge variant="outline" className={tone}>{statusText({ expiry_status: status, days_delta: days })}</Badge>;
+}
+
+function passwordScore(password: string) {
+  if (!password) return 0;
+  let score = 0;
+  if (password.length >= 8) score += 20;
+  if (password.length >= 12) score += 20;
+  if (password.length >= 16) score += 15;
+  if (/[a-z]/.test(password) && /[A-Z]/.test(password)) score += 15;
+  if (/\d/.test(password)) score += 10;
+  if (/[^A-Za-z0-9]/.test(password)) score += 15;
+  if (new Set(password).size >= Math.min(8, password.length)) score += 5;
+  if (/^[A-Za-z]+$/.test(password) || /^\d+$/.test(password)) score -= 20;
+  return Math.max(0, Math.min(score, 100));
+}
+
+function generatedPassword(length = 20) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+[]{}';
+  const values = new Uint32Array(length);
+  window.crypto.getRandomValues(values);
+  return Array.from(values, (value) => alphabet[value % alphabet.length]).join('');
+}
+
+function secretHealthTone(status?: SecretHealth['status']) {
+  if (status === 'at_risk') return 'border-red-200 bg-red-50 text-red-800';
+  if (status === 'needs_review') return 'border-yellow-200 bg-yellow-50 text-yellow-900';
+  return 'border-emerald-200 bg-emerald-50 text-emerald-800';
+}
+
+function secretHealthLabel(health?: SecretHealth | null) {
+  if (!health) return 'No score';
+  if (health.status === 'at_risk') return `At risk · ${health.score}`;
+  if (health.status === 'needs_review') return `Review · ${health.score}`;
+  return `Healthy · ${health.score}`;
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -625,6 +677,11 @@ export default function DocVault() {
     expiring: entries.filter((entry) => entry.expiry_status === 'expiring_soon').length,
     valid: entries.filter((entry) => entry.expiry_status === 'valid').length,
   };
+  const secretSummary = {
+    total: entries.filter((entry) => entry.category === 'secret').length,
+    atRisk: entries.filter((entry) => entry.secret_health?.status === 'at_risk').length,
+    needsReview: entries.filter((entry) => entry.secret_health?.status === 'needs_review').length,
+  };
   const activeTabConfig = tabConfig.find((tab) => tab.id === activeTab) || tabConfig[0];
   const selectedUnlockMethod = unlockMethods.find((method) => method.id === unlockMethod) || unlockMethods[0];
   const usesSystemMfa = Boolean(systemMfaStatus?.available && systemMfaStatus.configured);
@@ -642,6 +699,7 @@ export default function DocVault() {
   const systemMfaFactorLabels = (systemMfaStatus?.enrolled_factors || [])
     .map((factorId) => systemMfaStatus?.supported_factors.find((factor) => factor.id === factorId)?.label || factorId)
     .join(', ');
+  const formPasswordScore = passwordScore(form.password);
 
   React.useEffect(() => {
     setPage(1);
@@ -934,6 +992,9 @@ export default function DocVault() {
       }
     }
     if (activeTab === 'secret') {
+      metadata.username = form.username.trim();
+      metadata.login_url = form.login_url.trim();
+      metadata.rotation_interval_days = Number(form.rotation_interval_days || 180);
       sensitive.password = form.password;
       sensitive.private_key = form.private_key;
     }
@@ -1151,7 +1212,7 @@ export default function DocVault() {
           </div>
         </div>
 
-        <div className="grid gap-3 md:grid-cols-4">
+        <div className="grid gap-3 md:grid-cols-5">
           <div className="rounded-lg border border-slate-200 bg-white p-4 text-slate-900 shadow-sm">
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs font-semibold uppercase text-slate-500">Total items</div>
@@ -1179,6 +1240,14 @@ export default function DocVault() {
               <ShieldCheck className="h-4 w-4" />
             </div>
             <div className="mt-2 text-3xl font-bold">{summary.valid}</div>
+          </div>
+          <div className={`rounded-lg border p-4 shadow-sm ${secretSummary.atRisk ? 'border-red-200 bg-white text-red-800' : 'border-emerald-200 bg-white text-emerald-800'}`}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs font-semibold uppercase">At-risk Secrets</div>
+              <KeyRound className="h-4 w-4" />
+            </div>
+            <div className="mt-2 text-3xl font-bold">{secretSummary.atRisk}</div>
+            <div className="mt-1 text-xs text-slate-500">{secretSummary.needsReview} need review</div>
           </div>
         </div>
 
@@ -1251,6 +1320,11 @@ export default function DocVault() {
                           </div>
                           <div className="mt-2 flex flex-wrap gap-1">
                             {entry.tags.map((tag) => <Badge key={tag} variant="secondary">{tag}</Badge>)}
+                            {entry.category === 'secret' && entry.secret_health && (
+                              <Badge variant="outline" className={secretHealthTone(entry.secret_health.status)}>
+                                {secretHealthLabel(entry.secret_health)}
+                              </Badge>
+                            )}
                             {cloudIntegration(entry) && (
                               <Badge variant="outline" className="gap-1">
                                 <Cloud className="h-3 w-3" />
@@ -1523,9 +1597,44 @@ export default function DocVault() {
 
                 {activeTab === 'secret' && (
                   <>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label>Username</Label>
+                        <Input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label>Login URL</Label>
+                        <Input placeholder="https://example.com" value={form.login_url} onChange={(e) => setForm({ ...form, login_url: e.target.value })} />
+                      </div>
+                    </div>
                     <div className="space-y-1.5">
-                      <Label>Password</Label>
-                      <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
+                      <div className="flex items-center justify-between gap-3">
+                        <Label>Password</Label>
+                        <Badge variant="outline" className={formPasswordScore >= 80 ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : formPasswordScore >= 60 ? 'border-yellow-200 bg-yellow-50 text-yellow-900' : 'border-red-200 bg-red-50 text-red-800'}>
+                          Strength {formPasswordScore}
+                        </Badge>
+                      </div>
+                      <div className="flex gap-2">
+                        <Input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => setForm((current) => ({ ...current, password: generatedPassword(20) }))}
+                        >
+                          <KeyRound className="h-4 w-4" />
+                          Generate
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label>Rotation interval days</Label>
+                      <Input
+                        type="number"
+                        min="30"
+                        step="30"
+                        value={form.rotation_interval_days}
+                        onChange={(e) => setForm({ ...form, rotation_interval_days: e.target.value })}
+                      />
                     </div>
                     <div className="space-y-1.5">
                       <Label>Private Key</Label>
@@ -2041,6 +2150,18 @@ export default function DocVault() {
                 <div className="font-semibold">{unlocked.title}</div>
                 <div className="text-sm text-muted-foreground">{unlocked.notes || 'No private notes'}</div>
               </div>
+              {unlocked.category === 'secret' && unlocked.secret_health && (
+                <div className={`rounded-lg border p-3 text-sm ${secretHealthTone(unlocked.secret_health.status)}`}>
+                  <div className="font-semibold">{secretHealthLabel(unlocked.secret_health)}</div>
+                  {unlocked.secret_health.issues.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {unlocked.secret_health.issues.map((issue) => (
+                        <Badge key={issue.id} variant="outline" className="bg-white/70">{issue.label}</Badge>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               {cloudIntegration(unlocked)?.file_url && (
                 <div className="rounded-lg border p-3 text-sm">
                   <div className="font-medium">{cloudProviderLabel(cloudIntegration(unlocked)?.provider)}</div>
