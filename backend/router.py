@@ -33,6 +33,7 @@ except ModuleNotFoundError:
         return None
 
 from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultEntryHistory, DocVaultMFAEnrollment, DocVaultSignature
+from .schema import ensure_docvault_schema
 from .schemas import (
     DocVaultAttachmentVersionCreate,
     DocVaultAttachmentVersionResponse,
@@ -862,6 +863,7 @@ async def create_entry(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     values = payload.model_dump()
     metadata = dict(values.get("public_metadata") or {})
     metadata["immutable"] = _metadata_bool(metadata.get("immutable"))
@@ -937,6 +939,7 @@ async def update_entry(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     incoming = payload.model_dump(exclude_unset=True)
@@ -1122,6 +1125,7 @@ async def list_entry_history(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     _get_entry_or_404(db, entry_id)
     history = (
         db.query(DocVaultEntryHistory)
@@ -1139,6 +1143,7 @@ async def restore_entry_history(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     history = (
@@ -1207,6 +1212,7 @@ async def restore_attachment_version(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     version = (
@@ -1274,6 +1280,7 @@ async def create_attachment_version(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     entry.category = "document"
@@ -1322,6 +1329,7 @@ async def link_cloud_document(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     metadata = dict(entry.public_metadata or {})
