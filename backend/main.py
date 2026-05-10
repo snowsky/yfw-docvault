@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.database import init_db
 from backend.router import router
+from backend.sharing import router as sharing_router
 
 
 app = FastAPI(title="DocVault", version="1.0.0")
@@ -40,3 +41,4 @@ def plugin_manifest() -> dict:
 
 
 app.include_router(router, prefix="/api/v1/docvault", tags=["docvault"])
+app.include_router(sharing_router, prefix="/api/v1", tags=["sharing"])

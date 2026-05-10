@@ -34,6 +34,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
+import { ShareButton } from '@/components/sharing/ShareButton';
 import { apiRequest } from '@/lib/api';
 
 type Category = 'credit_card' | 'ssl_certificate' | 'id_card' | 'document' | 'secret';
@@ -1534,6 +1535,7 @@ export default function DocVault() {
                           <Lock className="mr-2 h-4 w-4" />
                           Details
                         </Button>
+                        <ShareButton recordType="docvault_item" recordId={entry.id} />
                         {!isImmutable(entry) && (
                           <Button variant="outline" size="sm" onClick={() => startEditEntry(entry)}>
                             <PenLine className="mr-2 h-4 w-4" />
