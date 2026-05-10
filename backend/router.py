@@ -39,6 +39,7 @@ from .schemas import (
     DocVaultAuditPackageRequest,
     DocVaultAuditPackageResponse,
     DocVaultCloudLinkRequest,
+    DocVaultCopyEventRequest,
     DocVaultEntryCreate,
     DocVaultEntryResponse,
     DocVaultEntryUpdate,
@@ -877,7 +878,6 @@ async def delete_entry(
     current_user: MasterUser = Depends(get_current_user),
 ):
     entry = _get_entry_or_404(db, entry_id)
-    _ensure_mutable(entry)
     entry.is_archived = True
     db.add(entry)
     db.commit()
@@ -914,6 +914,27 @@ async def unlock_entry(
         details={"category": entry.category},
     )
     return _serialize_with_counts(db, entry, reveal=True)
+
+
+@router.post("/{entry_id}/copy-event", status_code=status.HTTP_204_NO_CONTENT)
+async def record_copy_event(
+    entry_id: int,
+    payload: DocVaultCopyEventRequest,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    entry = _get_entry_or_404(db, entry_id)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_COPY",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"category": entry.category, "field_name": payload.field_name},
+    )
+    return None
 
 
 @router.get("/{entry_id}/attachments", response_model=list[DocVaultAttachmentVersionResponse])

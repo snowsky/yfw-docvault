@@ -23,7 +23,7 @@ DocVault already supports:
 - Digital signature records.
 - Retention archive runs.
 - Audit package generation.
-- Immutable records that can be created once and protected from later mutation.
+- Immutable records that can be created once and protected from later edits while still allowing intentional deletion.
 
 ## Phase 1: Vault Quality
 
@@ -48,7 +48,7 @@ Implemented:
 - Weak, reused, missing metadata, and rotation review signals.
 - At-risk secret dashboard summary.
 - Secret health badges on list rows and unlocked detail views.
-- Creation-time immutable item option with backend enforcement against later edit, archive, relink, replacement, and retention archival.
+- Creation-time immutable item option with backend enforcement against later edit, relink, replacement, and automated retention archival, while allowing intentional user deletion.
 
 ## Phase 2: Shared Vaults And Permissions
 
@@ -109,6 +109,12 @@ Planned signals:
 - MFA enrollment status.
 - Audit export readiness.
 
+Implemented:
+
+- Field-level copy buttons for unlocked secret usernames, login URLs, passwords, and private keys.
+- Clipboard auto-clear after 30 seconds when browser permissions allow it.
+- Dedicated backend copy audit events separate from unlock events.
+
 ## Phase 5: Advanced Integrations
 
 Goal: add power-user and compliance features after the core workflows are stable.
@@ -127,13 +133,13 @@ Candidate capabilities:
 
 ## Suggested Next Slice
 
-The next practical implementation slice should be copy/reveal audit events and safer clipboard handling for secrets.
+The next practical implementation slice should be recent security activity in the dashboard.
 
 Scope:
 
-- Log copy actions separately from unlock actions.
-- Add one-click copy buttons for password, username, and private key fields.
-- Clear copied secret values from the clipboard after a short delay when the browser permits it.
-- Show recent reveal/copy activity in the security dashboard.
+- Expose recent unlock and copy events from the audit trail.
+- Show recently revealed/copied secrets without exposing secret values.
+- Add filters for user, action type, and time window.
+- Include security activity in audit package manifests.
 
-This builds directly on the secret health work and makes sensitive access easier to review.
+This builds on the copy audit events and gives administrators a fast way to review sensitive access.

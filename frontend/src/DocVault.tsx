@@ -385,6 +385,17 @@ function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {
   return Boolean(entry.public_metadata?.immutable);
 }
 
+function secretCopyFields(entry: DocVaultEntry) {
+  const metadata = entry.public_metadata || {};
+  const payload = entry.sensitive_payload || {};
+  return [
+    { key: 'username', label: 'Username', value: metadata.username },
+    { key: 'login_url', label: 'Login URL', value: metadata.login_url },
+    { key: 'password', label: 'Password', value: payload.password, sensitive: true },
+    { key: 'private_key', label: 'Private Key', value: payload.private_key, sensitive: true, multiline: true },
+  ].filter((field) => field.value != null && String(field.value).length > 0);
+}
+
 function readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1153,6 +1164,25 @@ export default function DocVault() {
     setMfaCode('');
   }
 
+  async function copyVaultField(entry: DocVaultEntry, fieldName: string, value: string) {
+    await navigator.clipboard.writeText(value);
+    apiRequest(`/docvault/${entry.id}/copy-event`, {
+      method: 'POST',
+      body: JSON.stringify({ field_name: fieldName }),
+    }).catch(() => undefined);
+    toast.success('Copied to clipboard');
+    window.setTimeout(() => {
+      navigator.clipboard.readText()
+        .then((current) => {
+          if (current === value) {
+            return navigator.clipboard.writeText('');
+          }
+          return undefined;
+        })
+        .catch(() => undefined);
+    }, 30000);
+  }
+
   function updateUnlockEnabled(method: UnlockMethod, enabled: boolean) {
     setUnlockSettings((current) => ({ ...current, enabled: { ...current.enabled, [method]: enabled } }));
   }
@@ -1513,8 +1543,7 @@ export default function DocVault() {
                         <Button
                           variant="ghost"
                           size="icon"
-                          aria-label={isImmutable(entry) ? `${entry.title} is immutable` : `Delete ${entry.title}`}
-                          disabled={isImmutable(entry)}
+                          aria-label={`Delete ${entry.title}`}
                           onClick={() => setPendingDelete(entry)}
                         >
                           <Trash2 className="h-4 w-4" />
@@ -1573,8 +1602,8 @@ export default function DocVault() {
               Delete <span className="font-semibold text-slate-900">{pendingDelete?.title}</span> from DocVault? This action cannot be undone.
             </p>
             {pendingDelete && isImmutable(pendingDelete) && (
-              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
-                This item is immutable and cannot be deleted.
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                This immutable item cannot be edited later, but you can still delete it intentionally.
               </div>
             )}
             <div className="flex justify-end gap-2">
@@ -1583,7 +1612,7 @@ export default function DocVault() {
               </Button>
               <Button
                 type="button"
-                disabled={deleteBusy || Boolean(pendingDelete && isImmutable(pendingDelete))}
+                disabled={deleteBusy}
                 className="border-red-600 bg-red-600 hover:border-red-700 hover:bg-red-700"
                 onClick={() => confirmDeleteEntry()}
               >
@@ -1948,7 +1977,7 @@ export default function DocVault() {
                     />
                     <span>
                       <span className="block font-semibold text-slate-900">Make this item immutable</span>
-                      <span className="block text-muted-foreground">After saving, this item cannot be edited, archived, relinked, or replaced.</span>
+                      <span className="block text-muted-foreground">After saving, this item cannot be edited, relinked, or replaced. It can still be deleted intentionally.</span>
                     </span>
                   </label>
                 )}
@@ -2380,7 +2409,29 @@ export default function DocVault() {
                   )}
                 </div>
               )}
-              <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(unlocked.sensitive_payload, null, 2)}</pre>
+              {unlocked.category === 'secret' ? (
+                <div className="space-y-2 rounded-lg border p-3">
+                  {secretCopyFields(unlocked).map((field) => (
+                    <div key={field.key} className="grid gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 sm:grid-cols-[130px_minmax(0,1fr)_auto] sm:items-center">
+                      <div className="text-xs font-semibold uppercase text-slate-500">{field.label}</div>
+                      <div className={`${field.multiline ? 'max-h-24 overflow-auto' : 'truncate'} font-mono text-xs text-slate-800`}>
+                        {field.sensitive ? '••••••••••••' : String(field.value)}
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => copyVaultField(unlocked, field.key, String(field.value)).catch((error) => toast.error(error.message || 'Copy failed'))}
+                      >
+                        <Copy className="mr-2 h-4 w-4" />
+                        Copy
+                      </Button>
+                    </div>
+                  ))}
+                  <div className="text-xs text-muted-foreground">Copied values are cleared from the clipboard after 30 seconds when browser permissions allow it.</div>
+                </div>
+              ) : (
+                <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(unlocked.sensitive_payload, null, 2)}</pre>
+              )}
               {cloudIntegration(unlocked)?.file_url && (
                 <Button variant="outline" onClick={() => window.open(cloudIntegration(unlocked)?.file_url, '_blank')}>
                   <ExternalLink className="mr-2 h-4 w-4" />
@@ -2388,16 +2439,18 @@ export default function DocVault() {
                 </Button>
               )}
               {unlocked.file_data_url && <Button variant="outline" onClick={() => window.open(unlocked.file_data_url!, '_blank')}>Open file</Button>}
-              <Button
-                variant="outline"
-                onClick={() => {
-                  navigator.clipboard.writeText(JSON.stringify(unlocked.sensitive_payload, null, 2));
-                  toast.success('Copied vault details');
-                }}
-              >
-                <Copy className="mr-2 h-4 w-4" />
-                Copy details
-              </Button>
+              {unlocked.category !== 'secret' && (
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    navigator.clipboard.writeText(JSON.stringify(unlocked.sensitive_payload, null, 2));
+                    toast.success('Copied vault details');
+                  }}
+                >
+                  <Copy className="mr-2 h-4 w-4" />
+                  Copy details
+                </Button>
+              )}
             </div>
           )}
         </DialogContent>

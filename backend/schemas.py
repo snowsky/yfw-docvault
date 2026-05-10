@@ -71,6 +71,10 @@ class DocVaultUnlockRequest(BaseModel):
     window: int = Field(default=1, ge=0)
 
 
+class DocVaultCopyEventRequest(BaseModel):
+    field_name: str = Field(min_length=1, max_length=80)
+
+
 class DocVaultMFASetupRequest(BaseModel):
     factor_id: Literal["google_auth", "ms_auth"]
     label: str | None = Field(default=None, max_length=160)
