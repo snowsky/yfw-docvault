@@ -17,6 +17,7 @@ import {
   PackageCheck,
   PenLine,
   Plus,
+  RotateCcw,
   Search,
   Settings,
   ShieldCheck,
@@ -103,6 +104,16 @@ interface AttachmentVersion {
   checksum_sha256: string;
   change_note?: string | null;
   is_current: boolean;
+  created_at: string;
+}
+
+interface EntryHistoryEvent {
+  id: number;
+  entry_id: number;
+  action: 'created' | 'updated' | string;
+  changed_fields: string[];
+  details: Record<string, any>;
+  restorable: boolean;
   created_at: string;
 }
 
@@ -347,6 +358,32 @@ function fileSize(bytes?: number | null) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function historyFieldLabel(field: string) {
+  const labels: Record<string, string> = {
+    created: 'Created',
+    title: 'Title',
+    owner_name: 'Owner',
+    issuer: 'Issuer',
+    expiry_date: 'Expiry date',
+    issue_date: 'Issue date',
+    public_metadata: 'Metadata',
+    sensitive_payload: 'Sensitive details',
+    notes: 'Private notes',
+    tags: 'Tags',
+    file_name: 'File name',
+    file_mime_type: 'File type',
+    file_size: 'File size',
+    file_data_url: 'File contents',
+  };
+  return labels[field] || field.replace(/_/g, ' ');
+}
+
+function historyActionLabel(event: EntryHistoryEvent) {
+  if (event.action === 'created') return 'Item created';
+  if (event.details?.attachment_changed) return 'Item and attachment updated';
+  return 'Item updated';
+}
+
 function cloudProviderLabel(provider?: string | null) {
   if (provider === 'google_drive') return 'Google Drive';
   if (provider === 'onedrive') return 'OneDrive';
@@ -380,6 +417,25 @@ function approvalStatusTone(status: ApprovalStatus) {
   if (status === 'rejected') return 'border-red-200 bg-red-50 text-red-800';
   if (status === 'review_requested' || status === 'needs_changes') return 'border-yellow-200 bg-yellow-50 text-yellow-900';
   return 'border-slate-200 bg-slate-50 text-slate-700';
+}
+
+function documentDetails(entry: DocVaultEntry) {
+  const cloud = cloudIntegration(entry);
+  return {
+    title: entry.title,
+    file_name: entry.file_name,
+    file_type: entry.file_mime_type,
+    file_size: entry.file_size != null ? fileSize(entry.file_size) : null,
+    classification: documentLabelText(documentLabel(entry)),
+    approval_status: approvalStatusText(approvalStatus(entry)),
+    retention_years: entry.public_metadata?.retention_years ?? null,
+    retention_start_date: entry.public_metadata?.retention_start_date ?? null,
+    cloud_provider: cloud ? cloudProviderLabel(cloud.provider) : null,
+    cloud_file_name: cloud?.file_name ?? null,
+    cloud_file_id: cloud?.file_id ?? null,
+    cloud_file_url: cloud?.file_url ?? null,
+    local_file_available: Boolean(entry.file_data_url),
+  };
 }
 
 function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {
@@ -706,6 +762,7 @@ export default function DocVault() {
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
   const [certificateInfo, setCertificateInfo] = React.useState<CertificateInfo | null>(null);
   const [historyEntry, setHistoryEntry] = React.useState<DocVaultEntry | null>(null);
+  const [itemHistory, setItemHistory] = React.useState<EntryHistoryEvent[]>([]);
   const [versions, setVersions] = React.useState<AttachmentVersion[]>([]);
   const [signatureEntry, setSignatureEntry] = React.useState<DocVaultEntry | null>(null);
   const [signatures, setSignatures] = React.useState<SignatureRecord[]>([]);
@@ -878,8 +935,38 @@ export default function DocVault() {
 
   async function loadHistory(entry: DocVaultEntry) {
     setHistoryEntry(entry);
-    const data = await apiRequest<AttachmentVersion[]>(`/docvault/${entry.id}/attachments`);
-    setVersions(data);
+    const [history, attachmentVersions] = await Promise.all([
+      apiRequest<EntryHistoryEvent[]>(`/docvault/${entry.id}/history`),
+      apiRequest<AttachmentVersion[]>(`/docvault/${entry.id}/attachments`),
+    ]);
+    setItemHistory(history);
+    setVersions(attachmentVersions);
+  }
+
+  async function restoreItemHistory(event: EntryHistoryEvent) {
+    if (!historyEntry) return;
+    const confirmed = window.confirm(`Restore "${historyEntry.title}" to the ${new Date(event.created_at).toLocaleString()} version?`);
+    if (!confirmed) return;
+    const data = await apiRequest<{ entry: DocVaultEntry }>(`/docvault/${historyEntry.id}/history/${event.id}/restore`, {
+      method: 'POST',
+    });
+    if (unlocked?.id === historyEntry.id) setUnlocked(null);
+    await loadEntries();
+    await loadHistory(data.entry);
+    toast.success('Item restored');
+  }
+
+  async function restoreAttachmentVersion(version: AttachmentVersion) {
+    if (!historyEntry) return;
+    const confirmed = window.confirm(`Restore "${historyEntry.title}" to attachment v${version.version}?`);
+    if (!confirmed) return;
+    const data = await apiRequest<{ entry: DocVaultEntry }>(`/docvault/${historyEntry.id}/attachments/${version.id}/restore`, {
+      method: 'POST',
+    });
+    if (unlocked?.id === historyEntry.id) setUnlocked(null);
+    await loadEntries();
+    await loadHistory(data.entry);
+    toast.success(`Restored attachment v${version.version}`);
   }
 
   async function loadSignatures(entry: DocVaultEntry) {
@@ -1540,10 +1627,6 @@ export default function DocVault() {
                                 Open
                               </Button>
                             )}
-                            <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
-                              <History className="mr-2 h-4 w-4" />
-                              History
-                            </Button>
                             <Button variant="outline" size="sm" onClick={() => loadSignatures(entry).catch((error) => toast.error(error.message || 'Signatures failed'))}>
                               <PenLine className="mr-2 h-4 w-4" />
                               Sign
@@ -1553,6 +1636,10 @@ export default function DocVault() {
                         <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
                           <Lock className="mr-2 h-4 w-4" />
                           Details
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => loadHistory(entry).catch((error) => toast.error(error.message || 'History failed'))}>
+                          <History className="mr-2 h-4 w-4" />
+                          History
                         </Button>
                         <ShareButton recordType="docvault_item" recordId={entry.id} />
                         {!isImmutable(entry) && (
@@ -2450,6 +2537,8 @@ export default function DocVault() {
                   ))}
                   <div className="text-xs text-muted-foreground">Copied values are cleared from the clipboard after 30 seconds when browser permissions allow it.</div>
                 </div>
+              ) : unlocked.category === 'document' ? (
+                <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(documentDetails(unlocked), null, 2)}</pre>
               ) : (
                 <pre className="max-h-72 overflow-auto rounded-lg bg-muted p-3 text-xs">{JSON.stringify(unlocked.sensitive_payload, null, 2)}</pre>
               )}
@@ -2464,7 +2553,8 @@ export default function DocVault() {
                 <Button
                   variant="outline"
                   onClick={() => {
-                    navigator.clipboard.writeText(JSON.stringify(unlocked.sensitive_payload, null, 2));
+                    const details = unlocked.category === 'document' ? documentDetails(unlocked) : unlocked.sensitive_payload;
+                    navigator.clipboard.writeText(JSON.stringify(details, null, 2));
                     toast.success('Copied vault details');
                   }}
                 >
@@ -2480,22 +2570,66 @@ export default function DocVault() {
       <Dialog open={!!historyEntry} onOpenChange={(open) => !open && setHistoryEntry(null)}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><History className="h-5 w-5" /> Attachment history</DialogTitle>
+            <DialogTitle className="flex items-center gap-2"><History className="h-5 w-5" /> Item history</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             <div className="font-semibold">{historyEntry?.title}</div>
-            {versions.map((version) => (
-              <div key={version.id} className="rounded-lg border p-3 text-sm">
+            {itemHistory.map((event) => (
+              <div key={event.id} className="rounded-lg border p-3 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="font-medium">v{version.version} · {version.file_name}</div>
-                  {version.is_current && <Badge variant="outline">Current</Badge>}
+                  <div className="font-medium">{historyActionLabel(event)}</div>
+                  <div className="flex items-center gap-2">
+                    <div className="text-xs text-muted-foreground">{new Date(event.created_at).toLocaleString()}</div>
+                    {event.restorable && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => restoreItemHistory(event).catch((error) => toast.error(error.message || 'Restore failed'))}
+                      >
+                        <RotateCcw className="h-4 w-4" />
+                        Restore
+                      </Button>
+                    )}
+                  </div>
                 </div>
-                <div className="mt-1 text-muted-foreground">{fileSize(version.file_size)} · {new Date(version.created_at).toLocaleString()}</div>
-                <div className="mt-1 font-mono text-xs text-muted-foreground">{version.checksum_sha256}</div>
-                {version.change_note && <div className="mt-2">{version.change_note}</div>}
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {event.changed_fields.map((field) => (
+                    <Badge key={field} variant="outline">{historyFieldLabel(field)}</Badge>
+                  ))}
+                </div>
               </div>
             ))}
-            {versions.length === 0 && <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">No attachment versions yet.</div>}
+            {itemHistory.length === 0 && <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">No item updates recorded yet.</div>}
+            {historyEntry?.category === 'document' && (
+              <div className="space-y-2 pt-2">
+                <div className="text-xs font-semibold uppercase text-muted-foreground">Attachment versions</div>
+                {versions.map((version) => (
+                  <div key={version.id} className="rounded-lg border p-3 text-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-medium">v{version.version} · {version.file_name}</div>
+                      <div className="flex items-center gap-2">
+                        {version.is_current ? (
+                          <Badge variant="outline">Current</Badge>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => restoreAttachmentVersion(version).catch((error) => toast.error(error.message || 'Restore failed'))}
+                          >
+                            <RotateCcw className="h-4 w-4" />
+                            Restore
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-1 text-muted-foreground">{fileSize(version.file_size)} · {new Date(version.created_at).toLocaleString()}</div>
+                    <div className="mt-1 font-mono text-xs text-muted-foreground">{version.checksum_sha256}</div>
+                    {version.change_note && <div className="mt-2">{version.change_note}</div>}
+                  </div>
+                ))}
+                {versions.length === 0 && <div className="rounded-lg border border-dashed p-6 text-center text-sm text-muted-foreground">No attachment versions yet.</div>}
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>

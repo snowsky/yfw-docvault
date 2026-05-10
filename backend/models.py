@@ -70,6 +70,19 @@ class DocVaultAttachmentVersion(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class DocVaultEntryHistory(Base):
+    __tablename__ = "docvault_entry_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entry_id = Column(Integer, ForeignKey("docvault_entries.id", ondelete="CASCADE"), nullable=False, index=True)
+    action = Column(String, nullable=False)
+    changed_fields = Column(JSON, nullable=False, default=list)
+    details = Column(JSON, nullable=True)
+    snapshot = Column(EncryptedJSON(), nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 class DocVaultSignature(Base):
     __tablename__ = "docvault_signatures"
 

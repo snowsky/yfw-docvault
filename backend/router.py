@@ -32,7 +32,8 @@ except ModuleNotFoundError:
     def log_audit_event(**kwargs):
         return None
 
-from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultMFAEnrollment, DocVaultSignature
+from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultEntryHistory, DocVaultMFAEnrollment, DocVaultSignature
+from .schema import ensure_docvault_schema
 from .schemas import (
     DocVaultAttachmentVersionCreate,
     DocVaultAttachmentVersionResponse,
@@ -41,6 +42,7 @@ from .schemas import (
     DocVaultCloudLinkRequest,
     DocVaultCopyEventRequest,
     DocVaultEntryCreate,
+    DocVaultEntryHistoryResponse,
     DocVaultEntryResponse,
     DocVaultEntryUpdate,
     DocVaultMFAEnrollmentResponse,
@@ -50,6 +52,7 @@ from .schemas import (
     DocVaultMFAVerifyRequest,
     DocVaultSystemMFAStatusResponse,
     DocVaultRetentionRunResponse,
+    DocVaultRestoreResponse,
     DocVaultScanRequest,
     DocVaultScanResponse,
     DocVaultSignatureCreate,
@@ -302,6 +305,19 @@ def _version_response(version: DocVaultAttachmentVersion) -> DocVaultAttachmentV
     )
 
 
+def _history_response(history: DocVaultEntryHistory) -> DocVaultEntryHistoryResponse:
+    return DocVaultEntryHistoryResponse(
+        id=history.id,
+        entry_id=history.entry_id,
+        action=history.action,
+        changed_fields=history.changed_fields or [],
+        details=history.details or {},
+        restorable=bool(history.snapshot),
+        created_by=history.created_by,
+        created_at=history.created_at,
+    )
+
+
 def _signature_response(signature: DocVaultSignature) -> DocVaultSignatureResponse:
     return DocVaultSignatureResponse(
         id=signature.id,
@@ -550,6 +566,82 @@ def _create_attachment_version(
     return version
 
 
+def _snapshot_date(value: date | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _parse_snapshot_date(value: Any) -> date | None:
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+def _entry_snapshot(entry: DocVaultEntry) -> dict[str, Any]:
+    return {
+        "category": entry.category,
+        "title": entry.title,
+        "owner_name": entry.owner_name,
+        "issuer": entry.issuer,
+        "expiry_date": _snapshot_date(entry.expiry_date),
+        "issue_date": _snapshot_date(entry.issue_date),
+        "public_metadata": dict(entry.public_metadata or {}),
+        "sensitive_payload": dict(entry.sensitive_payload or {}),
+        "notes": entry.notes,
+        "tags": list(entry.tags or []),
+        "thumbnail_data_url": entry.thumbnail_data_url,
+        "file_name": entry.file_name,
+        "file_mime_type": entry.file_mime_type,
+        "file_size": entry.file_size,
+        "file_data_url": entry.file_data_url,
+    }
+
+
+def _restore_entry_snapshot(entry: DocVaultEntry, snapshot: dict[str, Any]) -> None:
+    entry.category = snapshot.get("category") or entry.category
+    entry.title = snapshot.get("title") or entry.title
+    entry.owner_name = snapshot.get("owner_name")
+    entry.issuer = snapshot.get("issuer")
+    entry.expiry_date = _parse_snapshot_date(snapshot.get("expiry_date"))
+    entry.issue_date = _parse_snapshot_date(snapshot.get("issue_date"))
+    entry.public_metadata = dict(snapshot.get("public_metadata") or {})
+    entry.sensitive_payload = dict(snapshot.get("sensitive_payload") or {})
+    entry.notes = snapshot.get("notes")
+    entry.tags = list(snapshot.get("tags") or [])
+    entry.thumbnail_data_url = snapshot.get("thumbnail_data_url")
+    entry.file_name = snapshot.get("file_name")
+    entry.file_mime_type = snapshot.get("file_mime_type")
+    entry.file_size = snapshot.get("file_size")
+    entry.file_data_url = snapshot.get("file_data_url")
+
+
+def _changed_snapshot_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    return sorted(key for key, value in after.items() if before.get(key) != value)
+
+
+def _record_entry_history(
+    db: Session,
+    entry: DocVaultEntry,
+    *,
+    action: str,
+    changed_fields: list[str],
+    user_id: int | None,
+    details: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> DocVaultEntryHistory:
+    history = DocVaultEntryHistory(
+        entry_id=entry.id,
+        action=action,
+        changed_fields=sorted(set(changed_fields)),
+        details=details or {},
+        snapshot=snapshot if snapshot is not None else _entry_snapshot(entry),
+        created_by=user_id,
+    )
+    db.add(history)
+    return history
+
+
 def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRequest) -> None:
     local_unlock_factors = {"local_fallback", "vault_password", "recovery_code"}
 
@@ -771,6 +863,7 @@ async def create_entry(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     values = payload.model_dump()
     metadata = dict(values.get("public_metadata") or {})
     metadata["immutable"] = _metadata_bool(metadata.get("immutable"))
@@ -804,6 +897,14 @@ async def create_entry(
     db.add(entry)
     db.commit()
     db.refresh(entry)
+    _record_entry_history(
+        db,
+        entry,
+        action="created",
+        changed_fields=["created"],
+        user_id=current_user.id,
+        details={"category": entry.category},
+    )
     if entry.category == "document" and (entry.file_name or entry.file_data_url):
         _create_attachment_version(
             db,
@@ -815,6 +916,8 @@ async def create_entry(
             change_note="Initial cloud link" if cloud_integration else "Initial upload",
             user_id=current_user.id,
         )
+        db.commit()
+    else:
         db.commit()
     log_audit_event(
         db=db,
@@ -836,6 +939,7 @@ async def update_entry(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     incoming = payload.model_dump(exclude_unset=True)
@@ -868,8 +972,8 @@ async def update_entry(
         metadata = dict(entry.public_metadata or {})
         metadata["password_updated_at"] = date.today().isoformat()
         entry.public_metadata = metadata
-    if entry.category == "document" and any(
-        old_document_snapshot.get(key) != getattr(entry, key)
+    changed_fields = [
+        key
         for key in (
             "title",
             "owner_name",
@@ -884,7 +988,17 @@ async def update_entry(
             "file_size",
             "file_data_url",
         )
-    ):
+        if key in incoming and old_document_snapshot.get(key) != getattr(entry, key)
+    ]
+    if incoming_sensitive_payload:
+        changed_fields.append("sensitive_payload")
+    old_cloud = (old_document_snapshot["public_metadata"] or {}).get("cloud_integration")
+    new_cloud = (entry.public_metadata or {}).get("cloud_integration")
+    attachment_changed = entry.category == "document" and any(
+        field in changed_fields for field in ("file_name", "file_mime_type", "file_size", "file_data_url")
+    )
+    cloud_link_changed = entry.category == "document" and old_cloud != new_cloud
+    if attachment_changed or cloud_link_changed:
         _create_attachment_version(
             db,
             entry,
@@ -894,6 +1008,18 @@ async def update_entry(
             file_data_url=incoming.get("file_data_url") or entry.file_data_url,
             change_note="Uploaded replacement" if old_document_snapshot["file_data_url"] != entry.file_data_url else "Updated document details",
             user_id=current_user.id,
+        )
+    if changed_fields:
+        _record_entry_history(
+            db,
+            entry,
+            action="updated",
+            changed_fields=changed_fields,
+            user_id=current_user.id,
+            details={
+                "category": entry.category,
+                "attachment_changed": attachment_changed or cloud_link_changed,
+            },
         )
     db.add(entry)
     db.commit()
@@ -993,6 +1119,160 @@ async def list_attachment_versions(
     return [_version_response(version) for version in versions]
 
 
+@router.get("/{entry_id}/history", response_model=list[DocVaultEntryHistoryResponse])
+async def list_entry_history(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    _get_entry_or_404(db, entry_id)
+    history = (
+        db.query(DocVaultEntryHistory)
+        .filter(DocVaultEntryHistory.entry_id == entry_id)
+        .order_by(DocVaultEntryHistory.created_at.desc(), DocVaultEntryHistory.id.desc())
+        .all()
+    )
+    return [_history_response(item) for item in history]
+
+
+@router.post("/{entry_id}/history/{history_id}/restore", response_model=DocVaultRestoreResponse)
+async def restore_entry_history(
+    entry_id: int,
+    history_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    entry = _get_entry_or_404(db, entry_id)
+    _ensure_mutable(entry)
+    history = (
+        db.query(DocVaultEntryHistory)
+        .filter(DocVaultEntryHistory.id == history_id, DocVaultEntryHistory.entry_id == entry_id)
+        .first()
+    )
+    if not history or not history.snapshot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Restorable history version not found")
+
+    before = _entry_snapshot(entry)
+    _restore_entry_snapshot(entry, dict(history.snapshot or {}))
+    changed_fields = _changed_snapshot_fields(before, _entry_snapshot(entry))
+    attachment_changed = entry.category == "document" and any(
+        field in changed_fields for field in ("file_name", "file_mime_type", "file_size", "file_data_url")
+    )
+    if attachment_changed:
+        _create_attachment_version(
+            db,
+            entry,
+            file_name=entry.file_name,
+            file_mime_type=entry.file_mime_type,
+            file_size=entry.file_size,
+            file_data_url=entry.file_data_url,
+            change_note=f"Restored from item history #{history.id}",
+            user_id=current_user.id,
+        )
+    if changed_fields:
+        _record_entry_history(
+            db,
+            entry,
+            action="restored",
+            changed_fields=changed_fields,
+            user_id=current_user.id,
+            details={
+                "category": entry.category,
+                "restored_from": "item_history",
+                "history_id": history.id,
+                "history_action": history.action,
+                "attachment_changed": attachment_changed,
+            },
+        )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_RESTORE",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"source": "item_history", "history_id": history.id},
+    )
+    return DocVaultRestoreResponse(
+        entry=_serialize_with_counts(db, entry),
+        restored_from={"source": "item_history", "history_id": history.id},
+    )
+
+
+@router.post("/{entry_id}/attachments/{version_id}/restore", response_model=DocVaultRestoreResponse)
+async def restore_attachment_version(
+    entry_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    entry = _get_entry_or_404(db, entry_id)
+    _ensure_mutable(entry)
+    version = (
+        db.query(DocVaultAttachmentVersion)
+        .filter(DocVaultAttachmentVersion.id == version_id, DocVaultAttachmentVersion.entry_id == entry_id)
+        .first()
+    )
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment version not found")
+
+    before = _entry_snapshot(entry)
+    entry.category = "document"
+    entry.file_name = version.file_name
+    entry.file_mime_type = version.file_mime_type
+    entry.file_size = version.file_size
+    entry.file_data_url = version.file_data_url
+    restored_version = _create_attachment_version(
+        db,
+        entry,
+        file_name=version.file_name,
+        file_mime_type=version.file_mime_type,
+        file_size=version.file_size,
+        file_data_url=version.file_data_url,
+        change_note=f"Restored from v{version.version}",
+        user_id=current_user.id,
+    )
+    changed_fields = _changed_snapshot_fields(before, _entry_snapshot(entry))
+    _record_entry_history(
+        db,
+        entry,
+        action="restored",
+        changed_fields=changed_fields or ["file_name", "file_mime_type", "file_size", "file_data_url"],
+        user_id=current_user.id,
+        details={
+            "category": entry.category,
+            "attachment_changed": True,
+            "restored_from": "attachment_version",
+            "attachment_version": version.version,
+            "restored_attachment_version": restored_version.version if restored_version else None,
+        },
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_ATTACHMENT_RESTORE",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"version": version.version},
+    )
+    return DocVaultRestoreResponse(
+        entry=_serialize_with_counts(db, entry),
+        restored_from={"source": "attachment_version", "version": version.version},
+    )
+
+
 @router.post("/{entry_id}/attachments", response_model=DocVaultAttachmentVersionResponse, status_code=status.HTTP_201_CREATED)
 async def create_attachment_version(
     entry_id: int,
@@ -1000,6 +1280,7 @@ async def create_attachment_version(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     entry.category = "document"
@@ -1018,6 +1299,14 @@ async def create_attachment_version(
         user_id=current_user.id,
     )
     db.add(entry)
+    _record_entry_history(
+        db,
+        entry,
+        action="updated",
+        changed_fields=["file_name", "file_mime_type", "file_size", "file_data_url"],
+        user_id=current_user.id,
+        details={"category": entry.category, "attachment_changed": True},
+    )
     db.commit()
     db.refresh(version)
     log_audit_event(
@@ -1040,6 +1329,7 @@ async def link_cloud_document(
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
+    ensure_docvault_schema(db)
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
     metadata = dict(entry.public_metadata or {})
@@ -1060,6 +1350,14 @@ async def link_cloud_document(
         user_id=current_user.id,
     )
     db.add(entry)
+    _record_entry_history(
+        db,
+        entry,
+        action="updated",
+        changed_fields=["public_metadata", "file_name", "file_mime_type", "file_data_url"],
+        user_id=current_user.id,
+        details={"category": entry.category, "attachment_changed": True},
+    )
     db.commit()
     db.refresh(entry)
     log_audit_event(
