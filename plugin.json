@@ -11,7 +11,15 @@
       "description": "Manage DocVault entries and MFA-gated sensitive details."
     }
   ],
-  "database_tables": ["docvault_entries", "docvault_attachment_versions", "docvault_signatures"],
+  "database_tables": [
+    "docvault_entries",
+    "docvault_attachment_versions",
+    "docvault_signatures",
+    "docvault_mfa_enrollments",
+    "docvault_share_tokens",
+    "docvault_document_links",
+    "docvault_attachment_locators"
+  ],
   "features": [
     "expiry-tracking",
     "ai-card-scanning",

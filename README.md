@@ -134,7 +134,14 @@ GET    /api/v1/docvault/{entry_id}/signatures
 POST   /api/v1/docvault/{entry_id}/signatures
 POST   /api/v1/docvault/retention/run
 POST   /api/v1/docvault/audit-package
+POST   /api/v1/docvault/import/scan
+POST   /api/v1/docvault/import/run
 ```
+
+Plugin mode also supports importing existing host-app documents into DocVault.
+The initial importer covers bank statements and is idempotent: scan/run creates
+DocVault entries plus secure source locators for unlinked statement files and
+statement attachments without copying file bytes.
 
 ## Notes
 

@@ -219,3 +219,52 @@ class DocVaultAuditPackageResponse(BaseModel):
     generated_by: str | None = None
     entries: list[dict[str, Any]]
     manifest: dict[str, Any]
+
+
+DocVaultImportComponent = Literal["bank_statement"]
+
+
+class DocVaultImportScanRequest(BaseModel):
+    components: list[DocVaultImportComponent] = Field(default_factory=lambda: ["bank_statement"])
+    include_statement_files: bool = True
+    include_statement_attachments: bool = True
+    limit: int | None = Field(default=None, ge=1, le=10000)
+
+
+class DocVaultImportRunRequest(DocVaultImportScanRequest):
+    dry_run: bool = False
+
+
+class DocVaultImportCandidate(BaseModel):
+    component: str
+    owner_type: str
+    owner_id: int
+    source_table: str
+    source_attachment_id: int
+    file_name: str
+    file_mime_type: str | None = None
+    file_size: int | None = None
+    storage_provider: str
+    storage_key: str
+    checksum_sha256: str | None = None
+    already_imported: bool = False
+    existing_entry_id: int | None = None
+
+
+class DocVaultImportSummary(BaseModel):
+    scanned: int
+    importable: int
+    already_imported: int
+    imported: int = 0
+    skipped: int = 0
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DocVaultImportScanResponse(BaseModel):
+    summary: DocVaultImportSummary
+    candidates: list[DocVaultImportCandidate]
+
+
+class DocVaultImportRunResponse(DocVaultImportScanResponse):
+    dry_run: bool
+    created_entry_ids: list[int] = Field(default_factory=list)
