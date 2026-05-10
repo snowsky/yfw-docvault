@@ -1117,10 +1117,29 @@ export default function DocVault() {
         payload.file_data_url = activeTab === 'document' && form.document_source === 'local' ? selectedFile?.dataUrl : null;
       }
     }
-    await apiRequest<DocVaultEntry>(isEditing ? `/docvault/${editingEntry!.id}` : '/docvault', {
+    const savedEntry = await apiRequest<DocVaultEntry>(isEditing ? `/docvault/${editingEntry!.id}` : '/docvault', {
       method: isEditing ? 'PUT' : 'POST',
       body: JSON.stringify(payload),
     });
+    if (historyEntry?.id === savedEntry.id) {
+      await loadHistory(savedEntry);
+    }
+    if (unlocked?.id === savedEntry.id) {
+      setUnlocked((current) => {
+        if (!current) return current;
+        const nextSensitive = Object.prototype.hasOwnProperty.call(payload, 'sensitive_payload')
+          ? { ...current.sensitive_payload, ...payload.sensitive_payload }
+          : current.sensitive_payload;
+        const nextNotes = Object.prototype.hasOwnProperty.call(payload, 'notes') ? payload.notes : current.notes;
+        const nextFileDataUrl = Object.prototype.hasOwnProperty.call(payload, 'file_data_url') ? payload.file_data_url : current.file_data_url;
+        return {
+          ...savedEntry,
+          sensitive_payload: nextSensitive,
+          notes: nextNotes,
+          file_data_url: nextFileDataUrl,
+        };
+      });
+    }
     setForm(emptyForm);
     setSelectedFile(null);
     setCertificateInfo(null);

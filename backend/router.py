@@ -838,13 +838,53 @@ async def update_entry(
 ):
     entry = _get_entry_or_404(db, entry_id)
     _ensure_mutable(entry)
-    old_file_data_url = entry.file_data_url
-    for key, value in payload.model_dump(exclude_unset=True).items():
-        setattr(entry, key, value)
     incoming = payload.model_dump(exclude_unset=True)
+    incoming_sensitive_payload = dict(incoming.get("sensitive_payload") or {}) if "sensitive_payload" in incoming else {}
+    old_document_snapshot = {
+        "category": entry.category,
+        "title": entry.title,
+        "owner_name": entry.owner_name,
+        "issuer": entry.issuer,
+        "expiry_date": entry.expiry_date,
+        "issue_date": entry.issue_date,
+        "public_metadata": dict(entry.public_metadata or {}),
+        "notes": entry.notes,
+        "tags": list(entry.tags or []),
+        "file_name": entry.file_name,
+        "file_mime_type": entry.file_mime_type,
+        "file_size": entry.file_size,
+        "file_data_url": entry.file_data_url,
+    }
+    if "sensitive_payload" in incoming and incoming["sensitive_payload"] is not None:
+        incoming["sensitive_payload"] = {
+            **dict(entry.sensitive_payload or {}),
+            **dict(incoming["sensitive_payload"] or {}),
+        }
+    for key, value in incoming.items():
+        setattr(entry, key, value)
     if entry.category == "document" and "public_metadata" in incoming:
         entry.public_metadata = _normalize_document_metadata(dict(entry.public_metadata or {}))
-    if entry.category == "document" and "file_data_url" in incoming and incoming.get("file_data_url") != old_file_data_url:
+    if entry.category == "secret" and incoming_sensitive_payload.get("password"):
+        metadata = dict(entry.public_metadata or {})
+        metadata["password_updated_at"] = date.today().isoformat()
+        entry.public_metadata = metadata
+    if entry.category == "document" and any(
+        old_document_snapshot.get(key) != getattr(entry, key)
+        for key in (
+            "title",
+            "owner_name",
+            "issuer",
+            "expiry_date",
+            "issue_date",
+            "public_metadata",
+            "notes",
+            "tags",
+            "file_name",
+            "file_mime_type",
+            "file_size",
+            "file_data_url",
+        )
+    ):
         _create_attachment_version(
             db,
             entry,
@@ -852,7 +892,7 @@ async def update_entry(
             file_mime_type=incoming.get("file_mime_type") or entry.file_mime_type,
             file_size=incoming.get("file_size") if incoming.get("file_size") is not None else entry.file_size,
             file_data_url=incoming.get("file_data_url") or entry.file_data_url,
-            change_note="Uploaded replacement",
+            change_note="Uploaded replacement" if old_document_snapshot["file_data_url"] != entry.file_data_url else "Updated document details",
             user_id=current_user.id,
         )
     db.add(entry)
