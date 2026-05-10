@@ -1069,20 +1069,53 @@ def _scan_import_candidates(
     current_user: MasterUser,
     payload: DocVaultImportScanRequest,
 ) -> list[DocVaultImportCandidate]:
+    candidates, _errors = _scan_import_candidates_with_errors(db, current_user, payload)
+    return candidates
+
+
+def _is_plugin_access_denied(exc: Exception) -> bool:
+    return "Access Denied:" in str(exc) and "is not allowed to access table" in str(exc)
+
+
+def _scan_import_candidates_with_errors(
+    db: Session,
+    current_user: MasterUser,
+    payload: DocVaultImportScanRequest,
+) -> tuple[list[DocVaultImportCandidate], list[dict[str, Any]]]:
     candidates: list[DocVaultImportCandidate] = []
+    errors: list[dict[str, Any]] = []
+
+    def add_component(component: str, scan_fn):
+        try:
+            candidates.extend(scan_fn())
+        except Exception as exc:
+            if not _is_plugin_access_denied(exc):
+                raise
+            db.rollback()
+            errors.append(
+                {
+                    "component": component,
+                    "source_table": component,
+                    "error": (
+                        f"{exc}. The plugin access setting permits API calls between plugins, "
+                        "but this scanner attempted direct table access. Other components were still scanned."
+                    ),
+                }
+            )
+
     if "bank_statement" in payload.components:
-        candidates.extend(_scan_bank_statement_import_candidates(db, current_user, payload))
+        add_component("bank_statement", lambda: _scan_bank_statement_import_candidates(db, current_user, payload))
     if "invoice" in payload.components:
-        candidates.extend(_scan_invoice_import_candidates(db, payload))
+        add_component("invoice", lambda: _scan_invoice_import_candidates(db, payload))
     if "expense" in payload.components:
-        candidates.extend(_scan_expense_import_candidates(db, payload))
+        add_component("expense", lambda: _scan_expense_import_candidates(db, payload))
     if "inventory" in payload.components:
-        candidates.extend(_scan_inventory_import_candidates(db, payload))
+        add_component("inventory", lambda: _scan_inventory_import_candidates(db, payload))
     if "portfolio" in payload.components:
-        candidates.extend(_scan_portfolio_import_candidates(db, current_user, payload))
+        add_component("portfolio", lambda: _scan_portfolio_import_candidates(db, current_user, payload))
     if payload.limit is not None:
         candidates = candidates[:payload.limit]
-    return candidates
+    return candidates, errors
 
 
 def _import_summary(candidates: list[DocVaultImportCandidate], *, imported: int = 0, errors: list[dict[str, Any]] | None = None) -> DocVaultImportSummary:
@@ -1208,9 +1241,9 @@ async def scan_existing_documents(
     current_user: MasterUser = Depends(get_current_user),
 ):
     ensure_docvault_schema(db)
-    candidates = _scan_import_candidates(db, current_user, payload)
+    candidates, errors = _scan_import_candidates_with_errors(db, current_user, payload)
     return DocVaultImportScanResponse(
-        summary=_import_summary(candidates),
+        summary=_import_summary(candidates, errors=errors),
         candidates=candidates,
     )
 
@@ -1222,9 +1255,8 @@ async def import_existing_documents(
     current_user: MasterUser = Depends(get_current_user),
 ):
     ensure_docvault_schema(db)
-    candidates = _scan_import_candidates(db, current_user, payload)
+    candidates, errors = _scan_import_candidates_with_errors(db, current_user, payload)
     created_entry_ids: list[int] = []
-    errors: list[dict[str, Any]] = []
 
     if not payload.dry_run:
         for candidate in candidates:
