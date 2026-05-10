@@ -977,6 +977,7 @@ async def import_existing_documents(
                     {
                         "source_table": candidate.source_table,
                         "source_attachment_id": candidate.source_attachment_id,
+                        "file_name": candidate.file_name,
                         "error": str(exc),
                     }
                 )

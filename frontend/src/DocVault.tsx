@@ -166,7 +166,7 @@ interface ImportSummary {
   already_imported: number;
   imported: number;
   skipped: number;
-  errors: Array<{ source_table?: string; source_attachment_id?: number; error: string }>;
+  errors: Array<{ source_table?: string; source_attachment_id?: number; file_name?: string; error: string }>;
 }
 
 interface ImportCandidate {
@@ -1893,9 +1893,24 @@ export default function DocVault() {
             </div>
 
             {Boolean(importScan?.summary.errors.length) && (
-              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
-                {importScan?.summary.errors.length} import error(s). Review server logs for source-level details.
-              </div>
+              <details className="rounded-lg border border-red-200 bg-red-50 text-sm text-red-800" open>
+                <summary className="cursor-pointer select-none px-3 py-2 font-semibold">
+                  {importScan?.summary.errors.length} import error(s) — click to expand
+                </summary>
+                <div className="max-h-48 overflow-auto divide-y divide-red-200 border-t border-red-200">
+                  {importScan?.summary.errors.map((err, idx) => (
+                    <div key={idx} className="px-3 py-2 space-y-0.5">
+                      <div className="flex items-center gap-2 font-mono text-xs text-red-700">
+                        <span className="font-semibold">{err.file_name ?? err.source_table ?? '—'}</span>
+                        {err.source_attachment_id != null && (
+                          <span className="text-red-500">#{err.source_attachment_id}</span>
+                        )}
+                      </div>
+                      <div className="font-mono text-xs break-all text-red-900">{err.error}</div>
+                    </div>
+                  ))}
+                </div>
+              </details>
             )}
 
             <div className="flex flex-wrap justify-end gap-2">
