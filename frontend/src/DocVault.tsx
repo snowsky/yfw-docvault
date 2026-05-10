@@ -160,6 +160,41 @@ interface SystemMfaStatus {
   disable_script: string;
 }
 
+interface ImportSummary {
+  scanned: number;
+  importable: number;
+  already_imported: number;
+  imported: number;
+  skipped: number;
+  errors: Array<{ source_table?: string; source_attachment_id?: number; error: string }>;
+}
+
+interface ImportCandidate {
+  component: string;
+  owner_type: string;
+  owner_id: number;
+  source_table: string;
+  source_attachment_id: number;
+  file_name: string;
+  file_mime_type?: string | null;
+  file_size?: number | null;
+  storage_provider: string;
+  storage_key: string;
+  checksum_sha256?: string | null;
+  already_imported: boolean;
+  existing_entry_id?: number | null;
+}
+
+interface ImportScanResponse {
+  summary: ImportSummary;
+  candidates: ImportCandidate[];
+}
+
+interface ImportRunResponse extends ImportScanResponse {
+  dry_run: boolean;
+  created_entry_ids: number[];
+}
+
 interface Asn1Node {
   tag: number;
   tagClass: number;
@@ -768,6 +803,9 @@ export default function DocVault() {
   const [signatures, setSignatures] = React.useState<SignatureRecord[]>([]);
   const [signatureForm, setSignatureForm] = React.useState({ signer_name: '', signer_email: '', provider: 'manual', signature_reference: '' });
   const [auditPackage, setAuditPackage] = React.useState<Record<string, any> | null>(null);
+  const [importDialogOpen, setImportDialogOpen] = React.useState(false);
+  const [importScan, setImportScan] = React.useState<ImportScanResponse | null>(null);
+  const [importBusy, setImportBusy] = React.useState(false);
   const [pendingDelete, setPendingDelete] = React.useState<DocVaultEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
   const titleInputRef = React.useRef<HTMLInputElement | null>(null);
@@ -1010,6 +1048,40 @@ export default function DocVault() {
     });
     setAuditPackage(data);
     toast.success('Audit package generated');
+  }
+
+  async function scanExistingDocuments() {
+    setImportBusy(true);
+    try {
+      const data = await apiRequest<ImportScanResponse>('/docvault/import/scan', {
+        method: 'POST',
+        body: JSON.stringify({ components: ['bank_statement'] }),
+      });
+      setImportScan(data);
+      toast.success(`Found ${data.summary.importable} statement document(s) to import`);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function runExistingDocumentImport() {
+    setImportBusy(true);
+    try {
+      const data = await apiRequest<ImportRunResponse>('/docvault/import/run', {
+        method: 'POST',
+        body: JSON.stringify({ components: ['bank_statement'], dry_run: false }),
+      });
+      setImportScan(data);
+      await loadEntries();
+      toast.success(`Imported ${data.summary.imported} statement document(s)`);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  function openImportDialog() {
+    setImportDialogOpen(true);
+    scanExistingDocuments().catch((error) => toast.error(error.message || 'Import scan failed'));
   }
 
   function applySystemMfaDefaults(status: SystemMfaStatus) {
@@ -1470,6 +1542,10 @@ export default function DocVault() {
               <PackageCheck className="h-4 w-4" />
               Audit package
             </Button>
+            <Button variant="outline" onClick={openImportDialog}>
+              <RotateCcw className="h-4 w-4" />
+              Import existing
+            </Button>
             <Button variant="outline" onClick={() => setSettingsOpen(true)}>
               <Settings className="h-4 w-4" />
               Settings
@@ -1725,6 +1801,91 @@ export default function DocVault() {
                 onClick={() => confirmDeleteEntry()}
               >
                 {deleteBusy ? 'Deleting...' : 'Delete'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <RotateCcw className="h-5 w-5 text-blue-700" />
+              Import existing documents
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
+              Scan bank statement files and statement attachments, then create DocVault document records for anything not already linked.
+            </div>
+            <div className="grid gap-3 sm:grid-cols-4">
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-semibold uppercase text-slate-500">Scanned</div>
+                <div className="mt-1 text-2xl font-bold">{importScan?.summary.scanned ?? 0}</div>
+              </div>
+              <div className="rounded-lg border border-blue-200 bg-white p-3 text-blue-800">
+                <div className="text-xs font-semibold uppercase">Ready</div>
+                <div className="mt-1 text-2xl font-bold">{importScan?.summary.importable ?? 0}</div>
+              </div>
+              <div className="rounded-lg border border-emerald-200 bg-white p-3 text-emerald-800">
+                <div className="text-xs font-semibold uppercase">Imported</div>
+                <div className="mt-1 text-2xl font-bold">{importScan?.summary.imported ?? 0}</div>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="text-xs font-semibold uppercase text-slate-500">Existing</div>
+                <div className="mt-1 text-2xl font-bold">{importScan?.summary.already_imported ?? 0}</div>
+              </div>
+            </div>
+
+            <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
+              {(importScan?.candidates || []).length === 0 ? (
+                <div className="p-4 text-sm text-muted-foreground">
+                  {importBusy ? 'Scanning statement documents...' : 'No statement documents found yet.'}
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-200">
+                  {(importScan?.candidates || []).slice(0, 25).map((candidate) => (
+                    <div key={`${candidate.source_table}-${candidate.source_attachment_id}`} className="flex items-center justify-between gap-3 p-3 text-sm">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
+                        <div className="text-xs text-muted-foreground">
+                          Statement #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
+                        </div>
+                      </div>
+                      <Badge variant="outline" className={candidate.already_imported ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-blue-200 bg-blue-50 text-blue-800'}>
+                        {candidate.already_imported ? 'Linked' : 'Ready'}
+                      </Badge>
+                    </div>
+                  ))}
+                  {(importScan?.candidates.length || 0) > 25 && (
+                    <div className="p-3 text-xs text-muted-foreground">
+                      Showing 25 of {importScan?.candidates.length} candidates.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {Boolean(importScan?.summary.errors.length) && (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                {importScan?.summary.errors.length} import error(s). Review server logs for source-level details.
+              </div>
+            )}
+
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                variant="outline"
+                disabled={importBusy}
+                onClick={() => scanExistingDocuments().catch((error) => toast.error(error.message || 'Import scan failed'))}
+              >
+                {importBusy ? 'Scanning...' : 'Rescan'}
+              </Button>
+              <Button
+                disabled={importBusy || !importScan || importScan.summary.importable === 0}
+                onClick={() => runExistingDocumentImport().catch((error) => toast.error(error.message || 'Import failed'))}
+              >
+                {importBusy ? 'Importing...' : `Import ${importScan?.summary.importable ?? 0}`}
               </Button>
             </div>
           </div>
