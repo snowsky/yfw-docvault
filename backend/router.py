@@ -15,7 +15,8 @@ from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 try:
@@ -1015,47 +1016,74 @@ def _scan_inventory_import_candidates(
     return candidates
 
 
-def _scan_portfolio_import_candidates(
+def _host_api_base_url(request: Request) -> str:
+    configured = os.getenv("DOCVAULT_HOST_API_URL") or os.getenv("YFW_HOST_API_URL")
+    if configured:
+        return configured.rstrip("/")
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/v1"
+
+
+async def _fetch_portfolio_import_sources(request: Request) -> list[dict[str, Any]]:
+    headers = {"X-Plugin-Caller": "docvault"}
+    authorization = request.headers.get("authorization")
+    cookie = request.headers.get("cookie")
+    if authorization:
+        headers["Authorization"] = authorization
+    if cookie:
+        headers["Cookie"] = cookie
+
+    url = f"{_host_api_base_url(request)}/investments/docvault/import-sources/portfolio-files"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(url, headers=headers)
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail")
+        except Exception:
+            detail = response.text
+        raise ValueError(detail or response.reason_phrase)
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
+
+
+async def _scan_portfolio_import_candidates(
     db: Session,
     current_user: MasterUser,
     payload: DocVaultImportScanRequest,
+    request: Request,
 ) -> list[DocVaultImportCandidate]:
     if not payload.include_portfolio_files:
         return []
-    InvestmentPortfolio, FileAttachment = _host_portfolio_models()
-    if InvestmentPortfolio is None or FileAttachment is None:
-        return []
 
-    tenant_id = _current_tenant_id(current_user)
     candidates: list[DocVaultImportCandidate] = []
-    query = (
-        db.query(FileAttachment)
-        .join(InvestmentPortfolio, FileAttachment.portfolio_id == InvestmentPortfolio.id)
-        .filter(InvestmentPortfolio.is_archived.is_(False))
-        .order_by(FileAttachment.created_at.desc())
-    )
-    if tenant_id is not None:
-        query = query.filter(FileAttachment.tenant_id == tenant_id)
-
-    attachments = query.all()
+    attachments = await _fetch_portfolio_import_sources(request)
     for attachment in attachments:
         if payload.limit is not None and len(candidates) >= payload.limit:
             break
-        locator = _locator_for_source(db, "investment_file_attachments", attachment.id)
-        file_type = getattr(attachment.file_type, "value", attachment.file_type)
+        attachment_id = int(attachment.get("id"))
+        locator = _locator_for_source(db, "investment_file_attachments", attachment_id)
+        file_type = attachment.get("file_type")
+        original_filename = attachment.get("original_filename")
+        stored_filename = attachment.get("stored_filename")
+        file_name = original_filename or stored_filename
+        local_path = attachment.get("local_path")
+        cloud_url = attachment.get("cloud_url")
+        storage_key = cloud_url or local_path
+        if not file_name or not storage_key:
+            continue
         candidates.append(
             DocVaultImportCandidate(
                 component="portfolio",
                 owner_type="portfolio",
-                owner_id=attachment.portfolio_id,
+                owner_id=int(attachment.get("portfolio_id")),
                 source_table="investment_file_attachments",
-                source_attachment_id=attachment.id,
-                file_name=attachment.original_filename or attachment.stored_filename,
-                file_mime_type=_infer_mime_type(attachment.original_filename, f"text/{file_type}" if file_type == "csv" else "application/pdf"),
-                file_size=attachment.file_size,
-                storage_provider=_storage_provider(attachment.local_path, attachment.cloud_url),
-                storage_key=attachment.cloud_url or attachment.local_path,
-                checksum_sha256=attachment.file_hash,
+                source_attachment_id=attachment_id,
+                file_name=file_name,
+                file_mime_type=_infer_mime_type(original_filename, f"text/{file_type}" if file_type == "csv" else "application/pdf"),
+                file_size=attachment.get("file_size"),
+                storage_provider=_storage_provider(local_path, cloud_url),
+                storage_key=storage_key,
+                checksum_sha256=attachment.get("file_hash"),
                 already_imported=locator is not None,
                 existing_entry_id=locator.entry_id if locator else None,
             )
@@ -1069,18 +1097,18 @@ def _scan_import_candidates(
     current_user: MasterUser,
     payload: DocVaultImportScanRequest,
 ) -> list[DocVaultImportCandidate]:
-    candidates, _errors = _scan_import_candidates_with_errors(db, current_user, payload)
-    return candidates
+    raise RuntimeError("Use _scan_import_candidates_with_errors for import scans.")
 
 
 def _is_plugin_access_denied(exc: Exception) -> bool:
     return "Access Denied:" in str(exc) and "is not allowed to access table" in str(exc)
 
 
-def _scan_import_candidates_with_errors(
+async def _scan_import_candidates_with_errors(
     db: Session,
     current_user: MasterUser,
     payload: DocVaultImportScanRequest,
+    request: Request,
 ) -> tuple[list[DocVaultImportCandidate], list[dict[str, Any]]]:
     candidates: list[DocVaultImportCandidate] = []
     errors: list[dict[str, Any]] = []
@@ -1112,7 +1140,17 @@ def _scan_import_candidates_with_errors(
     if "inventory" in payload.components:
         add_component("inventory", lambda: _scan_inventory_import_candidates(db, payload))
     if "portfolio" in payload.components:
-        add_component("portfolio", lambda: _scan_portfolio_import_candidates(db, current_user, payload))
+        try:
+            candidates.extend(await _scan_portfolio_import_candidates(db, current_user, payload, request))
+        except Exception as exc:
+            db.rollback()
+            errors.append(
+                {
+                    "component": "portfolio",
+                    "source_table": "portfolio",
+                    "error": str(exc),
+                }
+            )
     if payload.limit is not None:
         candidates = candidates[:payload.limit]
     return candidates, errors
@@ -1237,11 +1275,12 @@ def _create_imported_document(
 @router.post("/import/scan", response_model=DocVaultImportScanResponse)
 async def scan_existing_documents(
     payload: DocVaultImportScanRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
     ensure_docvault_schema(db)
-    candidates, errors = _scan_import_candidates_with_errors(db, current_user, payload)
+    candidates, errors = await _scan_import_candidates_with_errors(db, current_user, payload, request)
     return DocVaultImportScanResponse(
         summary=_import_summary(candidates, errors=errors),
         candidates=candidates,
@@ -1251,11 +1290,12 @@ async def scan_existing_documents(
 @router.post("/import/run", response_model=DocVaultImportRunResponse)
 async def import_existing_documents(
     payload: DocVaultImportRunRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: MasterUser = Depends(get_current_user),
 ):
     ensure_docvault_schema(db)
-    candidates, errors = _scan_import_candidates_with_errors(db, current_user, payload)
+    candidates, errors = await _scan_import_candidates_with_errors(db, current_user, payload, request)
     created_entry_ids: list[int] = []
 
     if not payload.dry_run:
