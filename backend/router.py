@@ -25,11 +25,15 @@ try:
     from core.models.models_per_tenant import User as TenantUser
     from core.routers.auth import get_current_user
     from core.utils.audit import log_audit_event
+
+    IS_PLUGIN_MODE = True
 except ModuleNotFoundError:
     from .auth import StandaloneUser as MasterUser
     from .auth import get_current_user
     from .database import StandaloneUser as TenantUser
     from .database import get_db
+
+    IS_PLUGIN_MODE = False
 
     def log_audit_event(**kwargs):
         return None
@@ -51,6 +55,8 @@ from .schemas import (
     DocVaultAuditPackageResponse,
     DocVaultCloudLinkRequest,
     DocVaultCopyEventRequest,
+    DocVaultDocumentLinkCreate,
+    DocVaultDocumentLinkResponse,
     DocVaultEntryCreate,
     DocVaultEntryHistoryResponse,
     DocVaultEntryResponse,
@@ -74,6 +80,7 @@ from .schemas import (
     DocVaultSignatureCreate,
     DocVaultSignatureResponse,
     DocVaultUnlockRequest,
+    VALID_OWNER_TYPES,
 )
 
 router = APIRouter()
@@ -436,6 +443,32 @@ def _serialize_with_counts(
     ).count()
     response.signatures_count = db.query(DocVaultSignature).filter(DocVaultSignature.entry_id == entry.id).count()
     return response
+
+
+def _normalize_owner_type(owner_type: str) -> str:
+    normalized = owner_type.strip().lower()
+    if normalized not in VALID_OWNER_TYPES:
+        allowed = ", ".join(sorted(VALID_OWNER_TYPES))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported owner_type. Expected one of: {allowed}",
+        )
+    return normalized
+
+
+def _link_response(db: Session, link: DocVaultDocumentLink) -> DocVaultDocumentLinkResponse:
+    entry = db.query(DocVaultEntry).filter(DocVaultEntry.id == link.entry_id).first()
+    return DocVaultDocumentLinkResponse(
+        id=link.id,
+        entry_id=link.entry_id,
+        owner_type=link.owner_type,
+        owner_id=link.owner_id,
+        linked_by=link.linked_by,
+        created_at=link.created_at,
+        entry_title=entry.title if entry else None,
+        entry_category=entry.category if entry else None,
+        file_name=entry.file_name if entry else None,
+    )
 
 
 def _sort_key(entry: DocVaultEntry) -> tuple[int, int]:
@@ -1347,6 +1380,44 @@ async def list_entries(
     return [_serialize_with_counts(db, entry, fingerprint_counts=fingerprint_counts) for entry in sorted(entries, key=_sort_key)]
 
 
+@router.get("/runtime")
+async def runtime_info(
+    current_user: MasterUser = Depends(get_current_user),
+):
+    return {
+        "mode": "plugin" if IS_PLUGIN_MODE else "standalone",
+        "plugin_mode": IS_PLUGIN_MODE,
+        "standalone": not IS_PLUGIN_MODE,
+        "features": {
+            "import_existing": IS_PLUGIN_MODE,
+        },
+    }
+
+
+@router.get("/by-entity/{owner_type}/{owner_id}", response_model=list[DocVaultEntryResponse])
+async def list_documents_for_entity(
+    owner_type: str,
+    owner_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    normalized_owner_type = _normalize_owner_type(owner_type)
+    entries = (
+        db.query(DocVaultEntry)
+        .join(DocVaultDocumentLink, DocVaultDocumentLink.entry_id == DocVaultEntry.id)
+        .filter(
+            DocVaultDocumentLink.owner_type == normalized_owner_type,
+            DocVaultDocumentLink.owner_id == owner_id,
+            DocVaultEntry.is_archived.is_(False),
+        )
+        .order_by(DocVaultEntry.created_at.desc())
+        .all()
+    )
+    fingerprint_counts = _password_reuse_counts(entries)
+    return [_serialize_with_counts(db, entry, fingerprint_counts=fingerprint_counts) for entry in entries]
+
+
 @router.get("/mfa/status", response_model=DocVaultSystemMFAStatusResponse)
 async def get_mfa_status(
     db: Session = Depends(get_db),
@@ -1690,6 +1761,99 @@ async def delete_entry(
         resource_id=str(entry.id),
         resource_name=entry.title,
         details={"category": entry.category},
+    )
+    return None
+
+
+@router.post("/{entry_id}/links", response_model=DocVaultDocumentLinkResponse, status_code=status.HTTP_201_CREATED)
+async def link_document_to_entity(
+    entry_id: int,
+    payload: DocVaultDocumentLinkCreate,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    entry = _get_entry_or_404(db, entry_id)
+    normalized_owner_type = _normalize_owner_type(payload.owner_type)
+    existing = (
+        db.query(DocVaultDocumentLink)
+        .filter(
+            DocVaultDocumentLink.entry_id == entry.id,
+            DocVaultDocumentLink.owner_type == normalized_owner_type,
+            DocVaultDocumentLink.owner_id == payload.owner_id,
+        )
+        .first()
+    )
+    if existing:
+        return _link_response(db, existing)
+
+    link = DocVaultDocumentLink(
+        entry_id=entry.id,
+        owner_type=normalized_owner_type,
+        owner_id=payload.owner_id,
+        linked_by=current_user.id,
+    )
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_LINK_CREATE",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"owner_type": normalized_owner_type, "owner_id": payload.owner_id, "link_id": link.id},
+    )
+    return _link_response(db, link)
+
+
+@router.get("/{entry_id}/links", response_model=list[DocVaultDocumentLinkResponse])
+async def list_document_links(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    _get_entry_or_404(db, entry_id)
+    links = (
+        db.query(DocVaultDocumentLink)
+        .filter(DocVaultDocumentLink.entry_id == entry_id)
+        .order_by(DocVaultDocumentLink.created_at.desc())
+        .all()
+    )
+    return [_link_response(db, link) for link in links]
+
+
+@router.delete("/{entry_id}/links/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def unlink_document_from_entity(
+    entry_id: int,
+    link_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    entry = _get_entry_or_404(db, entry_id)
+    link = (
+        db.query(DocVaultDocumentLink)
+        .filter(DocVaultDocumentLink.id == link_id, DocVaultDocumentLink.entry_id == entry.id)
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DocVault document link not found")
+    details = {"owner_type": link.owner_type, "owner_id": link.owner_id, "link_id": link.id}
+    db.delete(link)
+    db.commit()
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_LINK_DELETE",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details=details,
     )
     return None
 

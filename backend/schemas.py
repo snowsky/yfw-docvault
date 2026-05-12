@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 DocVaultCategory = Literal["credit_card", "ssl_certificate", "id_card", "document", "secret"]
 DocVaultCloudProvider = Literal["google_drive", "onedrive"]
+VALID_OWNER_TYPES = {"invoice", "expense", "statement", "inventory", "portfolio", "docvault_entry"}
 
 
 class DocVaultEntryBase(BaseModel):
@@ -61,6 +62,23 @@ class DocVaultEntryResponse(DocVaultEntryBase):
     secret_health: dict[str, Any] | None = None
     attachment_versions_count: int = 0
     signatures_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class DocVaultDocumentLinkCreate(BaseModel):
+    owner_type: str = Field(min_length=1, max_length=60)
+    owner_id: int = Field(gt=0)
+
+
+class DocVaultDocumentLinkResponse(DocVaultDocumentLinkCreate):
+    id: int
+    entry_id: int
+    linked_by: int | None = None
+    created_at: datetime
+    entry_title: str | None = None
+    entry_category: str | None = None
+    file_name: str | None = None
 
     model_config = {"from_attributes": True}
 

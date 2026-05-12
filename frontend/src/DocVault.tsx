@@ -160,6 +160,15 @@ interface SystemMfaStatus {
   disable_script: string;
 }
 
+interface RuntimeInfo {
+  mode: 'plugin' | 'standalone' | string;
+  plugin_mode: boolean;
+  standalone: boolean;
+  features: {
+    import_existing: boolean;
+  };
+}
+
 interface ImportSummary {
   scanned: number;
   importable: number;
@@ -810,6 +819,7 @@ export default function DocVault() {
   const [replacingRecoveryCodes, setReplacingRecoveryCodes] = React.useState(false);
   const [mfaEnrollments, setMfaEnrollments] = React.useState<MfaEnrollment[]>([]);
   const [systemMfaStatus, setSystemMfaStatus] = React.useState<SystemMfaStatus | null>(null);
+  const [runtimeInfo, setRuntimeInfo] = React.useState<RuntimeInfo | null>(null);
   const [mfaSetup, setMfaSetup] = React.useState<MfaSetup | null>(null);
   const [mfaVerifyCode, setMfaVerifyCode] = React.useState('');
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
@@ -826,6 +836,8 @@ export default function DocVault() {
   const [importBusy, setImportBusy] = React.useState(false);
   const [pendingDelete, setPendingDelete] = React.useState<DocVaultEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
+  const [saveBusy, setSaveBusy] = React.useState(false);
+  const saveInFlightRef = React.useRef(false);
   const titleInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const loadEntries = React.useCallback(async () => {
@@ -833,9 +845,22 @@ export default function DocVault() {
     setEntries(data);
   }, []);
 
+  const loadRuntimeInfo = React.useCallback(async () => {
+    const data = await apiRequest<RuntimeInfo>('/docvault/runtime');
+    setRuntimeInfo(data);
+  }, []);
+
   React.useEffect(() => {
     loadEntries().catch((error) => toast.error(error.message || 'Failed to load DocVault'));
-  }, [loadEntries]);
+    loadRuntimeInfo().catch(() => {
+      setRuntimeInfo({
+        mode: 'standalone',
+        plugin_mode: false,
+        standalone: true,
+        features: { import_existing: false },
+      });
+    });
+  }, [loadEntries, loadRuntimeInfo]);
 
   const filtered = entries.filter((entry) => {
     const text = `${entry.title} ${entry.file_name || ''} ${entry.owner_name || ''} ${entry.issuer || ''} ${entry.tags.join(' ')}`.toLowerCase();
@@ -885,6 +910,7 @@ export default function DocVault() {
     .map((factorId) => systemMfaStatus?.supported_factors.find((factor) => factor.id === factorId)?.label || factorId)
     .join(', ');
   const formPasswordScore = passwordScore(form.password);
+  const canImportExisting = Boolean(runtimeInfo?.features.import_existing);
 
   React.useEffect(() => {
     setPage(1);
@@ -1098,6 +1124,7 @@ export default function DocVault() {
   }
 
   function openImportDialog() {
+    if (!canImportExisting) return;
     setImportDialogOpen(true);
     scanExistingDocuments().catch((error) => toast.error(error.message || 'Import scan failed'));
   }
@@ -1192,6 +1219,11 @@ export default function DocVault() {
   }
 
   async function saveEntry() {
+    if (saveInFlightRef.current) return;
+    saveInFlightRef.current = true;
+    setSaveBusy(true);
+
+    try {
     const metadata: Record<string, any> = {};
     const sensitive: Record<string, any> = {};
     const isEditing = Boolean(editingEntry);
@@ -1325,6 +1357,10 @@ export default function DocVault() {
     setWizardStep(1);
     await loadEntries();
     toast.success(isEditing ? 'DocVault item updated' : 'Saved to DocVault');
+    } finally {
+      saveInFlightRef.current = false;
+      setSaveBusy(false);
+    }
   }
 
   async function deleteEntry(entry: DocVaultEntry) {
@@ -1473,6 +1509,8 @@ export default function DocVault() {
     setScanDraft(null);
     setWizardStep(1);
     setWizardOpen(true);
+    saveInFlightRef.current = false;
+    setSaveBusy(false);
     window.requestAnimationFrame(() => {
       titleInputRef.current?.focus();
     });
@@ -1518,12 +1556,15 @@ export default function DocVault() {
     setScanDraft(null);
     setWizardStep(2);
     setWizardOpen(true);
+    saveInFlightRef.current = false;
+    setSaveBusy(false);
     window.requestAnimationFrame(() => {
       titleInputRef.current?.focus();
     });
   }
 
   function closeWizard() {
+    if (saveInFlightRef.current) return;
     setWizardOpen(false);
     setWizardStep(1);
     setEditingEntry(null);
@@ -1544,7 +1585,7 @@ export default function DocVault() {
               <Archive className="h-4 w-4" />
               Secure records
             </div>
-            <h1 className="text-3xl font-bold tracking-tight text-slate-950">DocVault</h1>
+            <h1 className="text-3xl font-bold tracking-tight text-slate-950">YFW DocVault</h1>
             <p className="max-w-2xl text-sm text-muted-foreground">Manage credentials, IDs, certificates, and documents with expiry tracking and MFA-gated details.</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1560,10 +1601,12 @@ export default function DocVault() {
               <PackageCheck className="h-4 w-4" />
               Audit package
             </Button>
-            <Button variant="outline" onClick={openImportDialog}>
-              <RotateCcw className="h-4 w-4" />
-              Import existing
-            </Button>
+            {canImportExisting && (
+              <Button variant="outline" onClick={openImportDialog}>
+                <RotateCcw className="h-4 w-4" />
+                Import existing
+              </Button>
+            )}
             <Button variant="outline" onClick={() => setSettingsOpen(true)}>
               <Settings className="h-4 w-4" />
               Settings
@@ -1836,90 +1879,91 @@ export default function DocVault() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <RotateCcw className="h-5 w-5 text-blue-700" />
-              Import existing documents
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4">
-            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
-              Scan bank statement, invoice, expense, inventory, and portfolio attachments, then create DocVault document records for anything not already linked.
-            </div>
-            <div className="grid gap-3 sm:grid-cols-4">
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-xs font-semibold uppercase text-slate-500">Scanned</div>
-                <div className="mt-1 text-2xl font-bold">{importScan?.summary.scanned ?? 0}</div>
+      {canImportExisting && (
+        <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <RotateCcw className="h-5 w-5 text-blue-700" />
+                Import existing documents
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
+                Scan bank statement, invoice, expense, inventory, and portfolio attachments, then create DocVault document records for anything not already linked.
               </div>
-              <div className="rounded-lg border border-blue-200 bg-white p-3 text-blue-800">
-                <div className="text-xs font-semibold uppercase">Ready</div>
-                <div className="mt-1 text-2xl font-bold">{importScan?.summary.importable ?? 0}</div>
-              </div>
-              <div className="rounded-lg border border-emerald-200 bg-white p-3 text-emerald-800">
-                <div className="text-xs font-semibold uppercase">Imported</div>
-                <div className="mt-1 text-2xl font-bold">{importScan?.summary.imported ?? 0}</div>
-              </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-3">
-                <div className="text-xs font-semibold uppercase text-slate-500">Existing</div>
-                <div className="mt-1 text-2xl font-bold">{importScan?.summary.already_imported ?? 0}</div>
-              </div>
-            </div>
-
-            <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
-              {(importScan?.candidates || []).length === 0 ? (
-                <div className="p-4 text-sm text-muted-foreground">
-                  {importBusy ? 'Scanning documents...' : 'No importable documents found yet.'}
+              <div className="grid gap-3 sm:grid-cols-4">
+                <div className="rounded-lg border border-slate-200 bg-white p-3">
+                  <div className="text-xs font-semibold uppercase text-slate-500">Scanned</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.scanned ?? 0}</div>
                 </div>
-              ) : (
-                <div className="divide-y divide-slate-200">
-                  {(importScan?.candidates || []).slice(0, 25).map((candidate) => {
-                    const cloudUrl = candidate.storage_provider === 'cloud' && candidate.storage_key?.startsWith('http') ? candidate.storage_key : null;
-                    return (
-                      <div key={`${candidate.source_table}-${candidate.source_attachment_id}`} className="flex items-center justify-between gap-3 p-3 text-sm">
-                        <div className="min-w-0 flex-1">
-                          {cloudUrl ? (
+                <div className="rounded-lg border border-blue-200 bg-white p-3 text-blue-800">
+                  <div className="text-xs font-semibold uppercase">Ready</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.importable ?? 0}</div>
+                </div>
+                <div className="rounded-lg border border-emerald-200 bg-white p-3 text-emerald-800">
+                  <div className="text-xs font-semibold uppercase">Imported</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.imported ?? 0}</div>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-white p-3">
+                  <div className="text-xs font-semibold uppercase text-slate-500">Existing</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.already_imported ?? 0}</div>
+                </div>
+              </div>
+
+              <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
+                {(importScan?.candidates || []).length === 0 ? (
+                  <div className="p-4 text-sm text-muted-foreground">
+                    {importBusy ? 'Scanning documents...' : 'No importable documents found yet.'}
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-200">
+                    {(importScan?.candidates || []).slice(0, 25).map((candidate) => {
+                      const cloudUrl = candidate.storage_provider === 'cloud' && candidate.storage_key?.startsWith('http') ? candidate.storage_key : null;
+                      return (
+                        <div key={`${candidate.source_table}-${candidate.source_attachment_id}`} className="flex items-center justify-between gap-3 p-3 text-sm">
+                          <div className="min-w-0 flex-1">
+                            {cloudUrl ? (
+                              <a
+                                href={cloudUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-1 truncate font-medium text-blue-700 hover:underline"
+                              >
+                                <ExternalLink className="h-3 w-3 shrink-0" />
+                                <span className="truncate">{candidate.file_name}</span>
+                              </a>
+                            ) : (
+                              <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
+                            )}
+                            <div className="text-xs text-muted-foreground">
+                              {candidate.owner_type.replace(/_/g, ' ')} #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
+                            </div>
+                          </div>
+                          {candidate.already_imported && candidate.existing_entry_id ? (
                             <a
-                              href={cloudUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="flex items-center gap-1 truncate font-medium text-blue-700 hover:underline"
+                              href={`#entry-${candidate.existing_entry_id}`}
+                              onClick={() => setImportDialogOpen(false)}
+                              className="shrink-0 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
                             >
-                              <ExternalLink className="h-3 w-3 shrink-0" />
-                              <span className="truncate">{candidate.file_name}</span>
+                              Linked ↗
                             </a>
                           ) : (
-                            <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
+                            <Badge variant="outline" className={candidate.already_imported ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-blue-200 bg-blue-50 text-blue-800'}>
+                              {candidate.already_imported ? 'Linked' : 'Ready'}
+                            </Badge>
                           )}
-                          <div className="text-xs text-muted-foreground">
-                            {candidate.owner_type.replace(/_/g, ' ')} #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
-                          </div>
                         </div>
-                        {candidate.already_imported && candidate.existing_entry_id ? (
-                          <a
-                            href={`#entry-${candidate.existing_entry_id}`}
-                            onClick={() => setImportDialogOpen(false)}
-                            className="shrink-0 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
-                          >
-                            Linked ↗
-                          </a>
-                        ) : (
-                          <Badge variant="outline" className={candidate.already_imported ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-blue-200 bg-blue-50 text-blue-800'}>
-                            {candidate.already_imported ? 'Linked' : 'Ready'}
-                          </Badge>
-                        )}
+                      );
+                    })}
+                    {(importScan?.candidates.length || 0) > 25 && (
+                      <div className="p-3 text-xs text-muted-foreground">
+                        Showing 25 of {importScan?.candidates.length} candidates.
                       </div>
-                    );
-                  })}
-                  {(importScan?.candidates.length || 0) > 25 && (
-                    <div className="p-3 text-xs text-muted-foreground">
-                      Showing 25 of {importScan?.candidates.length} candidates.
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+                    )}
+                  </div>
+                )}
+              </div>
 
             {Boolean(importScan?.summary.errors.length) && (
               <details className="rounded-lg border border-red-200 bg-red-50 text-sm text-red-800" open>
@@ -1959,7 +2003,8 @@ export default function DocVault() {
             </div>
           </div>
         </DialogContent>
-      </Dialog>
+        </Dialog>
+      )}
 
       <Dialog open={wizardOpen} onOpenChange={(open) => !open && closeWizard()}>
         <DialogContent className="max-w-3xl">
@@ -2328,16 +2373,20 @@ export default function DocVault() {
             )}
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4">
-              <Button variant="ghost" onClick={closeWizard}>Cancel</Button>
+              <Button variant="ghost" disabled={saveBusy} onClick={closeWizard}>Cancel</Button>
               <div className="flex gap-2">
-                <Button variant="outline" disabled={wizardStep === 1 || Boolean(editingEntry && wizardStep === 2)} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
+                <Button variant="outline" disabled={saveBusy || wizardStep === 1 || Boolean(editingEntry && wizardStep === 2)} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
                   Back
                 </Button>
                 {wizardStep < 3 ? (
                   <Button onClick={() => setWizardStep((step) => Math.min(3, step + 1))}>Next</Button>
                 ) : (
-                  <Button onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}>
-                    {editingEntry ? 'Save Changes' : 'Save to Vault'}
+                  <Button
+                    disabled={saveBusy}
+                    aria-busy={saveBusy}
+                    onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}
+                  >
+                    {saveBusy ? 'Saving...' : editingEntry ? 'Save Changes' : 'Save to Vault'}
                   </Button>
                 )}
               </div>
