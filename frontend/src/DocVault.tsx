@@ -46,6 +46,7 @@ type DocumentSource = 'local' | 'google_drive' | 'onedrive';
 type DocumentLabel = 'unclassified' | 'confidential' | 'finance' | 'legal' | 'hr' | 'identity' | 'tax' | 'vendor' | 'audit';
 type ApprovalStatus = 'draft' | 'review_requested' | 'approved' | 'rejected' | 'needs_changes';
 type UnlockMethod = 'mfa_google' | 'mfa_microsoft' | 'vault_password' | 'recovery_code' | 'local_confirmation';
+type UnlockIntent = 'details' | 'file';
 
 interface UnlockSettings {
   enabled: Record<UnlockMethod, boolean>;
@@ -939,6 +940,7 @@ export default function DocVault() {
   const [wizardStep, setWizardStep] = React.useState(1);
   const [scanDraft, setScanDraft] = React.useState<Record<string, any> | null>(null);
   const [unlocking, setUnlocking] = React.useState<DocVaultEntry | null>(null);
+  const [unlockIntent, setUnlockIntent] = React.useState<UnlockIntent>('details');
   const [unlocked, setUnlocked] = React.useState<DocVaultEntry | null>(null);
   const [mfaCode, setMfaCode] = React.useState('');
   const [unlockMethod, setUnlockMethod] = React.useState<UnlockMethod>(() => {
@@ -1518,6 +1520,11 @@ export default function DocVault() {
     }
   }
 
+  function startUnlock(entry: DocVaultEntry, intent: UnlockIntent = 'details') {
+    setUnlockIntent(intent);
+    setUnlocking(entry);
+  }
+
   async function unlockEntry() {
     if (!unlocking) return;
     if (!unlockSettings.enabled[unlockMethod]) {
@@ -1528,8 +1535,13 @@ export default function DocVault() {
       method: 'POST',
       body: JSON.stringify({ factor_id: selectedUnlockMethod.factorId, user_input: mfaCode }),
     });
-    setUnlocked(data);
+    if (unlockIntent === 'file' && data.file_data_url) {
+      setPreviewEntry(data);
+    } else {
+      setUnlocked(data);
+    }
     setUnlocking(null);
+    setUnlockIntent('details');
     setMfaCode('');
   }
 
@@ -1904,7 +1916,12 @@ export default function DocVault() {
                                     window.location.assign(sourceUrl);
                                     return;
                                   }
-                                  setUnlocking(entry);
+                                  const cloudFileUrl = cloudIntegration(entry)?.file_url;
+                                  if (cloudFileUrl) {
+                                    window.open(cloudFileUrl, '_blank', 'noopener,noreferrer');
+                                    return;
+                                  }
+                                  startUnlock(entry, 'file');
                                 }}
                               >
                                 <ExternalLink className="mr-2 h-4 w-4" />
@@ -1917,7 +1934,7 @@ export default function DocVault() {
                             </Button>
                           </>
                         )}
-                        <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
+                        <Button variant="outline" size="sm" onClick={() => startUnlock(entry, 'details')}>
                           <Lock className="mr-2 h-4 w-4" />
                           Details
                         </Button>
@@ -2858,10 +2875,21 @@ export default function DocVault() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={!!unlocking} onOpenChange={(open) => !open && setUnlocking(null)}>
+      <Dialog
+        open={!!unlocking}
+        onOpenChange={(open) => {
+          if (!open) {
+            setUnlocking(null);
+            setUnlockIntent('details');
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><Lock className="h-5 w-5" /> Unlock vault details</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              <Lock className="h-5 w-5" />
+              {unlockIntent === 'file' ? 'Unlock file preview' : 'Unlock vault details'}
+            </DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             {availableUnlockMethods.length === 0 ? (
@@ -2893,7 +2921,9 @@ export default function DocVault() {
                     placeholder={selectedUnlockMethod.placeholder}
                   />
                 </div>
-                <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>Unlock</Button>
+                <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>
+                  {unlockIntent === 'file' ? 'Unlock and preview file' : 'Unlock'}
+                </Button>
               </>
             )}
           </div>
