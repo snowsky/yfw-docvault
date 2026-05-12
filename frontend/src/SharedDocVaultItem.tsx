@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { FilePreviewDialog } from '@/components/FilePreviewDialog';
 
 interface SharedDocVaultItem {
   record_type: 'docvault_item';
@@ -71,6 +72,7 @@ export default function SharedDocVaultItemPage() {
   const [selectedFactorId, setSelectedFactorId] = React.useState('');
   const [unlockValue, setUnlockValue] = React.useState('');
   const [unlocking, setUnlocking] = React.useState(false);
+  const [previewOpen, setPreviewOpen] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
 
@@ -243,19 +245,32 @@ export default function SharedDocVaultItemPage() {
                 )}
 
                 {item.file_data_url && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => downloadDataUrl(item.file_data_url!, item.file_name || `docvault-item-${item.id}`)}
-                  >
-                    Download file
-                  </Button>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setPreviewOpen(true)}>
+                      Preview file
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => downloadDataUrl(item.file_data_url!, item.file_name || `docvault-item-${item.id}`)}
+                    >
+                      Download file
+                    </Button>
+                  </div>
                 )}
               </div>
             )}
           </CardContent>
         </Card>
       )}
+
+      <FilePreviewDialog
+        open={previewOpen}
+        onOpenChange={setPreviewOpen}
+        dataUrl={item?.file_data_url}
+        fileName={item?.file_name}
+        mimeType={item?.file_mime_type}
+      />
 
       <p className="mt-6 text-center text-xs text-muted-foreground">Powered by YourFinanceWORKS DocVault</p>
     </div>

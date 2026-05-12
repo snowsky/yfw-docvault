@@ -36,6 +36,7 @@ import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
 import { ShareButton } from '@/components/sharing/ShareButton';
+import { FilePreviewDialog } from '@/components/FilePreviewDialog';
 import { apiRequest } from '@/lib/api';
 
 type Category = 'credit_card' | 'ssl_certificate' | 'id_card' | 'document' | 'secret';
@@ -835,6 +836,7 @@ export default function DocVault() {
   const [importScan, setImportScan] = React.useState<ImportScanResponse | null>(null);
   const [importBusy, setImportBusy] = React.useState(false);
   const [pendingDelete, setPendingDelete] = React.useState<DocVaultEntry | null>(null);
+  const [previewEntry, setPreviewEntry] = React.useState<DocVaultEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
   const [saveBusy, setSaveBusy] = React.useState(false);
   const saveInFlightRef = React.useRef(false);
@@ -2827,7 +2829,7 @@ export default function DocVault() {
                   Open cloud file
                 </Button>
               )}
-              {unlocked.file_data_url && <Button variant="outline" onClick={() => window.open(unlocked.file_data_url!, '_blank')}>Open file</Button>}
+              {unlocked.file_data_url && <Button variant="outline" onClick={() => setPreviewEntry(unlocked)}>Preview file</Button>}
               {unlocked.category !== 'secret' && (
                 <Button
                   variant="outline"
@@ -2845,6 +2847,14 @@ export default function DocVault() {
           )}
         </DialogContent>
       </Dialog>
+
+      <FilePreviewDialog
+        open={!!previewEntry}
+        onOpenChange={(open) => !open && setPreviewEntry(null)}
+        dataUrl={previewEntry?.file_data_url}
+        fileName={previewEntry?.file_name}
+        mimeType={previewEntry?.file_mime_type}
+      />
 
       <Dialog open={!!historyEntry} onOpenChange={(open) => !open && setHistoryEntry(null)}>
         <DialogContent className="max-w-2xl">
