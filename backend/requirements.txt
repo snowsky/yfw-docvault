@@ -5,3 +5,4 @@ psycopg2-binary==2.9.10
 pydantic==2.10.3
 qrcode[pil]==8.0
 httpx==0.28.1
+mcp>=1.0.0
