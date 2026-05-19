@@ -10,14 +10,35 @@
 
 | Component | What exists today | Gap |
 |---|---|---|
-| **DocVault backend** | Full router (1 259 lines), models, schemas, MFA, versioned attachments, signatures, retention, audit packaging | No service layer — all logic is inline in `router.py` |
+| **DocVault backend** | Full router, models, schemas, MFA, versioned attachments, signatures, retention, audit packaging | No service layer — all logic is inline in `router.py` |
 | **DocVault plugin hook** | `backend/__init__.py` registers routes at `/api/v1/docvault` | No MCP registration |
 | **Expense attachments** | `ExpenseAttachment` model + `core/routers/expenses/attachments.py` | Files in `attachments/tenant_X/expenses/` or cloud. No DocVault link |
 | **Invoice attachments** | `InvoiceAttachment` model + `core/routers/invoices/attachments.py` | Same pattern. No DocVault link |
 | **Statement attachments** | `BankStatementAttachment` model + `core/routers/sync.py` | Same pattern. No DocVault link |
 | **Inventory attachments** | `ItemAttachment` model + `core/services/attachment_service.py` | Same pattern. No DocVault link |
 | **MCP server** | `api/MCP/` with FastMCP, tools, api_client | No `docvault_*` tools |
-| **Generic document model** | Plan calls for `owner_type` / `owner_id` on documents | **Does not exist yet** |
+| **Generic document model** | `DocVaultDocumentLink` + `DocVaultAttachmentLocator` exist, with schema compatibility creation | Host hook adapter and MCP tools still missing |
+
+## Implementation Status — 2026-05-10
+
+Already implemented in this repo:
+
+- `DocVaultDocumentLink` and `DocVaultAttachmentLocator` models.
+- Idempotent schema creation for link and locator tables in `backend/schema.py`.
+- Complete `plugin.json` table list including MFA, share tokens, links, and locators.
+- Import scan/run flow that creates DocVault entries, document links, locators, and metadata-only attachment versions.
+- Link-management API routes:
+  - `POST /api/v1/docvault/{entry_id}/links`
+  - `GET /api/v1/docvault/{entry_id}/links`
+  - `DELETE /api/v1/docvault/{entry_id}/links/{link_id}`
+  - `GET /api/v1/docvault/by-entity/{owner_type}/{owner_id}`
+
+Best next implementation slice:
+
+1. Add `backend/service.py` only around document search/link/classification/retention-risk behavior first, not the whole router at once.
+2. Add safe MCP-ready API helpers for missing classification, classification update, linked-entity search, and retention risks.
+3. Add standalone MCP wrappers that call those API/service methods.
+4. Add host-plugin MCP registration once the host MCP registry shape is available.
 
 ---
 

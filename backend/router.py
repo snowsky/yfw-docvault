@@ -7,6 +7,7 @@ import hashlib
 import base64
 import hmac
 import io
+import os
 import secrets
 import struct
 import time
@@ -14,7 +15,8 @@ from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 try:
@@ -23,16 +25,28 @@ try:
     from core.models.models_per_tenant import User as TenantUser
     from core.routers.auth import get_current_user
     from core.utils.audit import log_audit_event
+
+    IS_PLUGIN_MODE = True
 except ModuleNotFoundError:
     from .auth import StandaloneUser as MasterUser
     from .auth import get_current_user
     from .database import StandaloneUser as TenantUser
     from .database import get_db
 
+    IS_PLUGIN_MODE = False
+
     def log_audit_event(**kwargs):
         return None
 
-from .models import DocVaultAttachmentVersion, DocVaultEntry, DocVaultEntryHistory, DocVaultMFAEnrollment, DocVaultSignature
+from .models import (
+    DocVaultAttachmentLocator,
+    DocVaultAttachmentVersion,
+    DocVaultDocumentLink,
+    DocVaultEntry,
+    DocVaultEntryHistory,
+    DocVaultMFAEnrollment,
+    DocVaultSignature,
+)
 from .schema import ensure_docvault_schema
 from .schemas import (
     DocVaultAttachmentVersionCreate,
@@ -41,6 +55,8 @@ from .schemas import (
     DocVaultAuditPackageResponse,
     DocVaultCloudLinkRequest,
     DocVaultCopyEventRequest,
+    DocVaultDocumentLinkCreate,
+    DocVaultDocumentLinkResponse,
     DocVaultEntryCreate,
     DocVaultEntryHistoryResponse,
     DocVaultEntryResponse,
@@ -51,6 +67,12 @@ from .schemas import (
     DocVaultMFASetupResponse,
     DocVaultMFAVerifyRequest,
     DocVaultSystemMFAStatusResponse,
+    DocVaultImportCandidate,
+    DocVaultImportRunRequest,
+    DocVaultImportRunResponse,
+    DocVaultImportScanRequest,
+    DocVaultImportScanResponse,
+    DocVaultImportSummary,
     DocVaultRetentionRunResponse,
     DocVaultRestoreResponse,
     DocVaultScanRequest,
@@ -58,6 +80,7 @@ from .schemas import (
     DocVaultSignatureCreate,
     DocVaultSignatureResponse,
     DocVaultUnlockRequest,
+    VALID_OWNER_TYPES,
 )
 
 router = APIRouter()
@@ -422,6 +445,32 @@ def _serialize_with_counts(
     return response
 
 
+def _normalize_owner_type(owner_type: str) -> str:
+    normalized = owner_type.strip().lower()
+    if normalized not in VALID_OWNER_TYPES:
+        allowed = ", ".join(sorted(VALID_OWNER_TYPES))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported owner_type. Expected one of: {allowed}",
+        )
+    return normalized
+
+
+def _link_response(db: Session, link: DocVaultDocumentLink) -> DocVaultDocumentLinkResponse:
+    entry = db.query(DocVaultEntry).filter(DocVaultEntry.id == link.entry_id).first()
+    return DocVaultDocumentLinkResponse(
+        id=link.id,
+        entry_id=link.entry_id,
+        owner_type=link.owner_type,
+        owner_id=link.owner_id,
+        linked_by=link.linked_by,
+        created_at=link.created_at,
+        entry_title=entry.title if entry else None,
+        entry_category=entry.category if entry else None,
+        file_name=entry.file_name if entry else None,
+    )
+
+
 def _sort_key(entry: DocVaultEntry) -> tuple[int, int]:
     status_name, days_delta, _ = _expiry_status(entry.category, entry.expiry_date)
     bucket = {"expired": 0, "expiring_soon": 1, "valid": 2}.get(status_name, 3)
@@ -545,6 +594,7 @@ def _create_attachment_version(
     file_data_url: str | None,
     change_note: str | None,
     user_id: int | None,
+    checksum_sha256: str | None = None,
 ) -> DocVaultAttachmentVersion | None:
     if not file_name and not file_data_url:
         return None
@@ -557,7 +607,7 @@ def _create_attachment_version(
         file_mime_type=file_mime_type or entry.file_mime_type,
         file_size=file_size if file_size is not None else entry.file_size,
         file_data_url=file_data_url or entry.file_data_url,
-        checksum_sha256=_checksum(file_data_url or entry.file_data_url),
+        checksum_sha256=checksum_sha256 or _checksum(file_data_url or entry.file_data_url),
         change_note=change_note,
         is_current=True,
         created_by=user_id,
@@ -692,6 +742,623 @@ def _verify_mfa(db: Session, current_user: MasterUser, payload: DocVaultUnlockRe
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This unlock method is not configured")
 
 
+def _host_statement_models():
+    try:
+        from core.models.models_per_tenant import BankStatement, BankStatementAttachment
+    except ModuleNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Attachment import scanning is available only in invoice_app plugin mode",
+        )
+    return BankStatement, BankStatementAttachment
+
+
+def _host_document_models():
+    try:
+        from core.models.models_per_tenant import Expense, ExpenseAttachment, InventoryItem, Invoice, InvoiceAttachment, ItemAttachment
+    except ModuleNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Attachment import scanning is available only in invoice_app plugin mode",
+        )
+    return Invoice, InvoiceAttachment, Expense, ExpenseAttachment, InventoryItem, ItemAttachment
+
+
+def _host_portfolio_models():
+    try:
+        from plugins.investments.models import FileAttachment, InvestmentPortfolio
+    except ModuleNotFoundError:
+        return None, None
+    return InvestmentPortfolio, FileAttachment
+
+
+def _current_tenant_id(current_user: MasterUser) -> int | None:
+    try:
+        from core.models.database import get_tenant_context
+
+        tenant_id = get_tenant_context()
+        if tenant_id:
+            return tenant_id
+    except Exception:
+        pass
+    return getattr(current_user, "tenant_id", None)
+
+
+def _infer_mime_type(filename: str | None, fallback: str | None = None) -> str | None:
+    if fallback:
+        return fallback
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        return "application/pdf"
+    if name.endswith(".csv"):
+        return "text/csv"
+    return None
+
+
+def _local_file_size(path: str | None) -> int | None:
+    if not path:
+        return None
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _storage_provider(storage_key: str | None, cloud_url: str | None = None) -> str:
+    if cloud_url:
+        return "cloud"
+    if not storage_key:
+        return "local"
+    if os.path.isabs(storage_key) or storage_key.startswith("attachments/"):
+        return "local"
+    return "cloud"
+
+
+def _statement_reference_key(statement_id: int) -> str:
+    return f"docvault://statement/{statement_id}"
+
+
+def _source_url(owner_type: str, owner_id: int) -> str | None:
+    return {
+        "statement": f"/statements?id={owner_id}",
+        "invoice": f"/invoices/view/{owner_id}",
+        "expense": f"/expenses/view/{owner_id}",
+        "inventory": f"/inventory/view/{owner_id}",
+        "portfolio": f"/investments/portfolio/{owner_id}",
+    }.get(owner_type)
+
+
+def _locator_for_source(db: Session, source_table: str, source_attachment_id: int) -> DocVaultAttachmentLocator | None:
+    return (
+        db.query(DocVaultAttachmentLocator)
+        .filter(
+            DocVaultAttachmentLocator.source_table == source_table,
+            DocVaultAttachmentLocator.source_attachment_id == source_attachment_id,
+        )
+        .first()
+    )
+
+
+def _scan_bank_statement_import_candidates(
+    db: Session,
+    current_user: MasterUser,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    BankStatement, BankStatementAttachment = _host_statement_models()
+    tenant_id = _current_tenant_id(current_user)
+    candidates: list[DocVaultImportCandidate] = []
+
+    statements_query = db.query(BankStatement).filter(BankStatement.is_deleted.is_(False))
+    if tenant_id is not None:
+        statements_query = statements_query.filter(BankStatement.tenant_id == tenant_id)
+    statements = statements_query.order_by(BankStatement.created_at.desc()).all()
+
+    for statement in statements:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+
+        if payload.include_statement_files:
+            locator = _locator_for_source(db, "bank_statements", statement.id)
+            statement_path = getattr(statement, "file_path", None)
+            statement_cloud_url = getattr(statement, "cloud_file_url", None)
+            candidates.append(
+                DocVaultImportCandidate(
+                    component="bank_statement",
+                    owner_type="statement",
+                    owner_id=statement.id,
+                    source_table="bank_statements",
+                    source_attachment_id=statement.id,
+                    file_name=statement.original_filename or statement.stored_filename,
+                    file_mime_type=_infer_mime_type(statement.original_filename),
+                    file_size=_local_file_size(statement_path),
+                    storage_provider=_storage_provider(statement_path, statement_cloud_url) if statement_path or statement_cloud_url else "reference",
+                    storage_key=statement_cloud_url or statement_path or _statement_reference_key(statement.id),
+                    checksum_sha256=statement.file_hash,
+                    already_imported=locator is not None,
+                    existing_entry_id=locator.entry_id if locator else None,
+                )
+            )
+
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+
+        if payload.include_statement_attachments:
+            attachments = (
+                db.query(BankStatementAttachment)
+                .filter(
+                    BankStatementAttachment.statement_id == statement.id,
+                    BankStatementAttachment.is_active.is_(True),
+                )
+                .order_by(BankStatementAttachment.created_at.desc())
+                .all()
+            )
+            for attachment in attachments:
+                if payload.limit is not None and len(candidates) >= payload.limit:
+                    break
+                locator = _locator_for_source(db, "bank_statement_attachments", attachment.id)
+                candidates.append(
+                    DocVaultImportCandidate(
+                        component="bank_statement",
+                        owner_type="statement",
+                        owner_id=statement.id,
+                        source_table="bank_statement_attachments",
+                        source_attachment_id=attachment.id,
+                        file_name=attachment.filename or attachment.stored_filename,
+                        file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                        file_size=attachment.file_size,
+                        storage_provider="cloud" if attachment.cloud_file_url else "local",
+                        storage_key=attachment.cloud_file_url or attachment.file_path,
+                        checksum_sha256=attachment.file_hash,
+                        already_imported=locator is not None,
+                        existing_entry_id=locator.entry_id if locator else None,
+                    )
+                )
+
+    return candidates
+
+
+def _scan_invoice_import_candidates(
+    db: Session,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_invoice_attachments:
+        return []
+    Invoice, InvoiceAttachment, _, _, _, _ = _host_document_models()
+    candidates: list[DocVaultImportCandidate] = []
+
+    query = (
+        db.query(InvoiceAttachment)
+        .join(Invoice, InvoiceAttachment.invoice_id == Invoice.id)
+        .filter(
+            InvoiceAttachment.is_active.is_(True),
+            Invoice.is_deleted.is_(False),
+        )
+        .order_by(InvoiceAttachment.created_at.desc())
+    )
+    attachments = query.all()
+
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "invoice_attachments", attachment.id)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="invoice",
+                owner_type="invoice",
+                owner_id=attachment.invoice_id,
+                source_table="invoice_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.filename or attachment.stored_filename,
+                file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                file_size=attachment.file_size,
+                storage_provider=_storage_provider(attachment.file_path),
+                storage_key=attachment.file_path,
+                checksum_sha256=attachment.file_hash,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
+def _scan_expense_import_candidates(
+    db: Session,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_expense_attachments:
+        return []
+    _, _, Expense, ExpenseAttachment, _, _ = _host_document_models()
+    candidates: list[DocVaultImportCandidate] = []
+
+    query = (
+        db.query(ExpenseAttachment)
+        .join(Expense, ExpenseAttachment.expense_id == Expense.id)
+        .filter(Expense.is_deleted.is_(False))
+        .order_by(ExpenseAttachment.uploaded_at.desc())
+    )
+    attachments = query.all()
+
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "expense_attachments", attachment.id)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="expense",
+                owner_type="expense",
+                owner_id=attachment.expense_id,
+                source_table="expense_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.filename,
+                file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                file_size=attachment.file_size or _local_file_size(attachment.file_path),
+                storage_provider=_storage_provider(attachment.file_path),
+                storage_key=attachment.file_path,
+                checksum_sha256=None,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
+def _scan_inventory_import_candidates(
+    db: Session,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_inventory_attachments:
+        return []
+    _, _, _, _, InventoryItem, ItemAttachment = _host_document_models()
+    candidates: list[DocVaultImportCandidate] = []
+
+    query = (
+        db.query(ItemAttachment)
+        .join(InventoryItem, ItemAttachment.item_id == InventoryItem.id)
+        .filter(
+            ItemAttachment.is_active.is_(True),
+            InventoryItem.is_active.is_(True),
+        )
+        .order_by(ItemAttachment.created_at.desc())
+    )
+    attachments = query.all()
+
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        locator = _locator_for_source(db, "item_attachments", attachment.id)
+        candidates.append(
+            DocVaultImportCandidate(
+                component="inventory",
+                owner_type="inventory",
+                owner_id=attachment.item_id,
+                source_table="item_attachments",
+                source_attachment_id=attachment.id,
+                file_name=attachment.filename or attachment.stored_filename,
+                file_mime_type=_infer_mime_type(attachment.filename, attachment.content_type),
+                file_size=attachment.file_size,
+                storage_provider=_storage_provider(attachment.file_path),
+                storage_key=attachment.file_path,
+                checksum_sha256=attachment.file_hash,
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
+def _host_api_base_url(request: Request) -> str:
+    configured = os.getenv("DOCVAULT_HOST_API_URL") or os.getenv("YFW_HOST_API_URL")
+    if configured:
+        return configured.rstrip("/")
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/api/v1"
+
+
+async def _fetch_portfolio_import_sources(request: Request) -> list[dict[str, Any]]:
+    headers = {"X-Plugin-Caller": "docvault"}
+    authorization = request.headers.get("authorization")
+    cookie = request.headers.get("cookie")
+    if authorization:
+        headers["Authorization"] = authorization
+    if cookie:
+        headers["Cookie"] = cookie
+
+    url = f"{_host_api_base_url(request)}/investments/docvault/import-sources/portfolio-files"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(url, headers=headers)
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail")
+        except Exception:
+            detail = response.text
+        raise ValueError(detail or response.reason_phrase)
+    payload = response.json()
+    return payload if isinstance(payload, list) else []
+
+
+async def _scan_portfolio_import_candidates(
+    db: Session,
+    current_user: MasterUser,
+    payload: DocVaultImportScanRequest,
+    request: Request,
+) -> list[DocVaultImportCandidate]:
+    if not payload.include_portfolio_files:
+        return []
+
+    candidates: list[DocVaultImportCandidate] = []
+    attachments = await _fetch_portfolio_import_sources(request)
+    for attachment in attachments:
+        if payload.limit is not None and len(candidates) >= payload.limit:
+            break
+        attachment_id = int(attachment.get("id"))
+        locator = _locator_for_source(db, "investment_file_attachments", attachment_id)
+        file_type = attachment.get("file_type")
+        original_filename = attachment.get("original_filename")
+        stored_filename = attachment.get("stored_filename")
+        file_name = original_filename or stored_filename
+        local_path = attachment.get("local_path")
+        cloud_url = attachment.get("cloud_url")
+        storage_key = cloud_url or local_path
+        if not file_name or not storage_key:
+            continue
+        candidates.append(
+            DocVaultImportCandidate(
+                component="portfolio",
+                owner_type="portfolio",
+                owner_id=int(attachment.get("portfolio_id")),
+                source_table="investment_file_attachments",
+                source_attachment_id=attachment_id,
+                file_name=file_name,
+                file_mime_type=_infer_mime_type(original_filename, f"text/{file_type}" if file_type == "csv" else "application/pdf"),
+                file_size=attachment.get("file_size"),
+                storage_provider=_storage_provider(local_path, cloud_url),
+                storage_key=storage_key,
+                checksum_sha256=attachment.get("file_hash"),
+                already_imported=locator is not None,
+                existing_entry_id=locator.entry_id if locator else None,
+            )
+        )
+
+    return candidates
+
+
+def _scan_import_candidates(
+    db: Session,
+    current_user: MasterUser,
+    payload: DocVaultImportScanRequest,
+) -> list[DocVaultImportCandidate]:
+    raise RuntimeError("Use _scan_import_candidates_with_errors for import scans.")
+
+
+def _is_plugin_access_denied(exc: Exception) -> bool:
+    return "Access Denied:" in str(exc) and "is not allowed to access table" in str(exc)
+
+
+async def _scan_import_candidates_with_errors(
+    db: Session,
+    current_user: MasterUser,
+    payload: DocVaultImportScanRequest,
+    request: Request,
+) -> tuple[list[DocVaultImportCandidate], list[dict[str, Any]]]:
+    candidates: list[DocVaultImportCandidate] = []
+    errors: list[dict[str, Any]] = []
+
+    def add_component(component: str, scan_fn):
+        try:
+            candidates.extend(scan_fn())
+        except Exception as exc:
+            if not _is_plugin_access_denied(exc):
+                raise
+            db.rollback()
+            errors.append(
+                {
+                    "component": component,
+                    "source_table": component,
+                    "error": (
+                        f"{exc}. The plugin access setting permits API calls between plugins, "
+                        "but this scanner attempted direct table access. Other components were still scanned."
+                    ),
+                }
+            )
+
+    if "bank_statement" in payload.components:
+        add_component("bank_statement", lambda: _scan_bank_statement_import_candidates(db, current_user, payload))
+    if "invoice" in payload.components:
+        add_component("invoice", lambda: _scan_invoice_import_candidates(db, payload))
+    if "expense" in payload.components:
+        add_component("expense", lambda: _scan_expense_import_candidates(db, payload))
+    if "inventory" in payload.components:
+        add_component("inventory", lambda: _scan_inventory_import_candidates(db, payload))
+    if "portfolio" in payload.components:
+        try:
+            candidates.extend(await _scan_portfolio_import_candidates(db, current_user, payload, request))
+        except Exception as exc:
+            db.rollback()
+            errors.append(
+                {
+                    "component": "portfolio",
+                    "source_table": "portfolio",
+                    "error": str(exc),
+                }
+            )
+    if payload.limit is not None:
+        candidates = candidates[:payload.limit]
+    return candidates, errors
+
+
+def _import_summary(candidates: list[DocVaultImportCandidate], *, imported: int = 0, errors: list[dict[str, Any]] | None = None) -> DocVaultImportSummary:
+    already_imported = sum(1 for candidate in candidates if candidate.already_imported)
+    return DocVaultImportSummary(
+        scanned=len(candidates),
+        importable=len(candidates) - already_imported,
+        already_imported=already_imported,
+        imported=imported,
+        skipped=already_imported,
+        errors=errors or [],
+    )
+
+
+def _create_imported_document(
+    db: Session,
+    candidate: DocVaultImportCandidate,
+    current_user: MasterUser,
+) -> DocVaultEntry:
+    source_label = candidate.owner_type.replace("_", " ")
+    import_note = (
+        f"Imported from {source_label} #{candidate.owner_id}"
+        f" ({candidate.source_table} #{candidate.source_attachment_id})."
+    )
+    if candidate.storage_provider == "reference":
+        import_note += " This source record does not have a stored attachment, so DocVault keeps a reference to the original record."
+    metadata = _normalize_document_metadata(
+        {
+            "source_module": candidate.component,
+            "source_table": candidate.source_table,
+            "source_attachment_id": candidate.source_attachment_id,
+            "source_owner_type": candidate.owner_type,
+            "source_owner_id": candidate.owner_id,
+            "source_url": _source_url(candidate.owner_type, candidate.owner_id),
+            "import_note": import_note,
+            "document_label": "finance",
+            "approval_status": "draft",
+            "immutable": False,
+        }
+    )
+    entry = DocVaultEntry(
+        category="document",
+        title=candidate.file_name,
+        file_name=candidate.file_name,
+        file_mime_type=candidate.file_mime_type,
+        file_size=candidate.file_size,
+        public_metadata=metadata,
+        sensitive_payload={},
+        notes=import_note,
+        tags=["imported", candidate.component],
+        created_by=current_user.id,
+    )
+    db.add(entry)
+    db.flush()
+
+    db.add(
+        DocVaultDocumentLink(
+            entry_id=entry.id,
+            owner_type=candidate.owner_type,
+            owner_id=candidate.owner_id,
+            linked_by=current_user.id,
+        )
+    )
+    db.add(
+        DocVaultAttachmentLocator(
+            entry_id=entry.id,
+            storage_provider=candidate.storage_provider,
+            storage_key=candidate.storage_key,
+            source_table=candidate.source_table,
+            source_attachment_id=candidate.source_attachment_id,
+            original_checksum=candidate.checksum_sha256,
+        )
+    )
+    _create_attachment_version(
+        db,
+        entry,
+        file_name=candidate.file_name,
+        file_mime_type=candidate.file_mime_type,
+        file_size=candidate.file_size,
+        file_data_url=None,
+        change_note="Imported external attachment reference",
+        user_id=current_user.id,
+        checksum_sha256=candidate.checksum_sha256,
+    )
+    import_snapshot = {
+        "category": "document",
+        "title": candidate.file_name,
+        "owner_name": None,
+        "issuer": None,
+        "expiry_date": None,
+        "issue_date": None,
+        "public_metadata": dict(metadata),
+        "sensitive_payload": {},
+        "notes": import_note,
+        "tags": ["imported", candidate.component],
+        "thumbnail_data_url": None,
+        "file_name": candidate.file_name,
+        "file_mime_type": candidate.file_mime_type,
+        "file_size": candidate.file_size,
+        "file_data_url": None,
+    }
+    _record_entry_history(
+        db,
+        entry,
+        action="imported",
+        changed_fields=["created"],
+        user_id=current_user.id,
+        details={
+            "owner_type": candidate.owner_type,
+            "owner_id": candidate.owner_id,
+            "source_table": candidate.source_table,
+            "source_attachment_id": candidate.source_attachment_id,
+        },
+        snapshot=import_snapshot,
+    )
+    return entry
+
+
+@router.post("/import/scan", response_model=DocVaultImportScanResponse)
+async def scan_existing_documents(
+    payload: DocVaultImportScanRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    candidates, errors = await _scan_import_candidates_with_errors(db, current_user, payload, request)
+    return DocVaultImportScanResponse(
+        summary=_import_summary(candidates, errors=errors),
+        candidates=candidates,
+    )
+
+
+@router.post("/import/run", response_model=DocVaultImportRunResponse)
+async def import_existing_documents(
+    payload: DocVaultImportRunRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    candidates, errors = await _scan_import_candidates_with_errors(db, current_user, payload, request)
+    created_entry_ids: list[int] = []
+
+    if not payload.dry_run:
+        for candidate in candidates:
+            if candidate.already_imported:
+                continue
+            try:
+                entry = _create_imported_document(db, candidate, current_user)
+                db.commit()
+                db.refresh(entry)
+                created_entry_ids.append(entry.id)
+            except Exception as exc:
+                db.rollback()
+                errors.append(
+                    {
+                        "source_table": candidate.source_table,
+                        "source_attachment_id": candidate.source_attachment_id,
+                        "file_name": candidate.file_name,
+                        "error": str(exc),
+                    }
+                )
+
+    return DocVaultImportRunResponse(
+        dry_run=payload.dry_run,
+        summary=_import_summary(candidates, imported=len(created_entry_ids), errors=errors),
+        candidates=candidates,
+        created_entry_ids=created_entry_ids,
+    )
+
+
 @router.get("", response_model=list[DocVaultEntryResponse])
 async def list_entries(
     category: str | None = Query(default=None),
@@ -711,6 +1378,44 @@ async def list_entries(
         entries = [entry for entry in entries if tag in (entry.tags or [])]
     fingerprint_counts = _password_reuse_counts(entries)
     return [_serialize_with_counts(db, entry, fingerprint_counts=fingerprint_counts) for entry in sorted(entries, key=_sort_key)]
+
+
+@router.get("/runtime")
+async def runtime_info(
+    current_user: MasterUser = Depends(get_current_user),
+):
+    return {
+        "mode": "plugin" if IS_PLUGIN_MODE else "standalone",
+        "plugin_mode": IS_PLUGIN_MODE,
+        "standalone": not IS_PLUGIN_MODE,
+        "features": {
+            "import_existing": IS_PLUGIN_MODE,
+        },
+    }
+
+
+@router.get("/by-entity/{owner_type}/{owner_id}", response_model=list[DocVaultEntryResponse])
+async def list_documents_for_entity(
+    owner_type: str,
+    owner_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    normalized_owner_type = _normalize_owner_type(owner_type)
+    entries = (
+        db.query(DocVaultEntry)
+        .join(DocVaultDocumentLink, DocVaultDocumentLink.entry_id == DocVaultEntry.id)
+        .filter(
+            DocVaultDocumentLink.owner_type == normalized_owner_type,
+            DocVaultDocumentLink.owner_id == owner_id,
+            DocVaultEntry.is_archived.is_(False),
+        )
+        .order_by(DocVaultEntry.created_at.desc())
+        .all()
+    )
+    fingerprint_counts = _password_reuse_counts(entries)
+    return [_serialize_with_counts(db, entry, fingerprint_counts=fingerprint_counts) for entry in entries]
 
 
 @router.get("/mfa/status", response_model=DocVaultSystemMFAStatusResponse)
@@ -1056,6 +1761,99 @@ async def delete_entry(
         resource_id=str(entry.id),
         resource_name=entry.title,
         details={"category": entry.category},
+    )
+    return None
+
+
+@router.post("/{entry_id}/links", response_model=DocVaultDocumentLinkResponse, status_code=status.HTTP_201_CREATED)
+async def link_document_to_entity(
+    entry_id: int,
+    payload: DocVaultDocumentLinkCreate,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    entry = _get_entry_or_404(db, entry_id)
+    normalized_owner_type = _normalize_owner_type(payload.owner_type)
+    existing = (
+        db.query(DocVaultDocumentLink)
+        .filter(
+            DocVaultDocumentLink.entry_id == entry.id,
+            DocVaultDocumentLink.owner_type == normalized_owner_type,
+            DocVaultDocumentLink.owner_id == payload.owner_id,
+        )
+        .first()
+    )
+    if existing:
+        return _link_response(db, existing)
+
+    link = DocVaultDocumentLink(
+        entry_id=entry.id,
+        owner_type=normalized_owner_type,
+        owner_id=payload.owner_id,
+        linked_by=current_user.id,
+    )
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_LINK_CREATE",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details={"owner_type": normalized_owner_type, "owner_id": payload.owner_id, "link_id": link.id},
+    )
+    return _link_response(db, link)
+
+
+@router.get("/{entry_id}/links", response_model=list[DocVaultDocumentLinkResponse])
+async def list_document_links(
+    entry_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    _get_entry_or_404(db, entry_id)
+    links = (
+        db.query(DocVaultDocumentLink)
+        .filter(DocVaultDocumentLink.entry_id == entry_id)
+        .order_by(DocVaultDocumentLink.created_at.desc())
+        .all()
+    )
+    return [_link_response(db, link) for link in links]
+
+
+@router.delete("/{entry_id}/links/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def unlink_document_from_entity(
+    entry_id: int,
+    link_id: int,
+    db: Session = Depends(get_db),
+    current_user: MasterUser = Depends(get_current_user),
+):
+    ensure_docvault_schema(db)
+    entry = _get_entry_or_404(db, entry_id)
+    link = (
+        db.query(DocVaultDocumentLink)
+        .filter(DocVaultDocumentLink.id == link_id, DocVaultDocumentLink.entry_id == entry.id)
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DocVault document link not found")
+    details = {"owner_type": link.owner_type, "owner_id": link.owner_id, "link_id": link.id}
+    db.delete(link)
+    db.commit()
+    log_audit_event(
+        db=db,
+        user_id=current_user.id,
+        user_email=current_user.email,
+        action="DOCVAULT_LINK_DELETE",
+        resource_type="docvault_entry",
+        resource_id=str(entry.id),
+        resource_name=entry.title,
+        details=details,
     )
     return None
 

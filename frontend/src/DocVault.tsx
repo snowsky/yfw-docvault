@@ -6,6 +6,7 @@ import {
   Cloud,
   Copy,
   CreditCard,
+  Download,
   ExternalLink,
   FileKey2,
   FileText,
@@ -24,6 +25,7 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -44,6 +46,7 @@ type DocumentSource = 'local' | 'google_drive' | 'onedrive';
 type DocumentLabel = 'unclassified' | 'confidential' | 'finance' | 'legal' | 'hr' | 'identity' | 'tax' | 'vendor' | 'audit';
 type ApprovalStatus = 'draft' | 'review_requested' | 'approved' | 'rejected' | 'needs_changes';
 type UnlockMethod = 'mfa_google' | 'mfa_microsoft' | 'vault_password' | 'recovery_code' | 'local_confirmation';
+type UnlockIntent = 'details' | 'file';
 
 interface UnlockSettings {
   enabled: Record<UnlockMethod, boolean>;
@@ -129,6 +132,14 @@ interface SignatureRecord {
   signed_at: string;
 }
 
+interface FilePreviewDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  dataUrl?: string | null;
+  fileName?: string | null;
+  mimeType?: string | null;
+}
+
 interface MfaEnrollment {
   factor_id: string;
   label?: string | null;
@@ -158,6 +169,50 @@ interface SystemMfaStatus {
   message: string;
   settings_path: string;
   disable_script: string;
+}
+
+interface RuntimeInfo {
+  mode: 'plugin' | 'standalone' | string;
+  plugin_mode: boolean;
+  standalone: boolean;
+  features: {
+    import_existing: boolean;
+  };
+}
+
+interface ImportSummary {
+  scanned: number;
+  importable: number;
+  already_imported: number;
+  imported: number;
+  skipped: number;
+  errors: Array<{ source_table?: string; source_attachment_id?: number; file_name?: string; error: string }>;
+}
+
+interface ImportCandidate {
+  component: string;
+  owner_type: string;
+  owner_id: number;
+  source_table: string;
+  source_attachment_id: number;
+  file_name: string;
+  file_mime_type?: string | null;
+  file_size?: number | null;
+  storage_provider: string;
+  storage_key: string;
+  checksum_sha256?: string | null;
+  already_imported: boolean;
+  existing_entry_id?: number | null;
+}
+
+interface ImportScanResponse {
+  summary: ImportSummary;
+  candidates: ImportCandidate[];
+}
+
+interface ImportRunResponse extends ImportScanResponse {
+  dry_run: boolean;
+  created_entry_ids: number[];
 }
 
 interface Asn1Node {
@@ -436,6 +491,149 @@ function documentDetails(entry: DocVaultEntry) {
     cloud_file_url: cloud?.file_url ?? null,
     local_file_available: Boolean(entry.file_data_url),
   };
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const match = dataUrl.match(/^data:([^;,]+)?((?:;[^,]*)?),(.+)$/);
+  if (!match) throw new Error('Unsupported file data');
+
+  const [, mime = 'application/octet-stream', metadata, data] = match;
+  if (metadata.includes(';base64')) {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return new Blob([bytes], { type: mime });
+  }
+
+  return new Blob([decodeURIComponent(data)], { type: mime });
+}
+
+function downloadBlobUrl(url: string, fileName: string) {
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+}
+
+function FilePreviewDialog({ open, onOpenChange, dataUrl, fileName, mimeType }: FilePreviewDialogProps) {
+  const [objectUrl, setObjectUrl] = React.useState<string | null>(null);
+  const [textPreview, setTextPreview] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const displayName = fileName || 'DocVault file';
+  const type = mimeType || dataUrl?.match(/^data:([^;,]+)/)?.[1] || 'application/octet-stream';
+  const isPdf = type === 'application/pdf' || displayName.toLowerCase().endsWith('.pdf');
+  const isImage = type.startsWith('image/');
+  const isText = type.startsWith('text/') || ['application/json', 'application/xml'].includes(type);
+
+  React.useEffect(() => {
+    if (!open || !dataUrl) {
+      setObjectUrl(null);
+      setTextPreview(null);
+      setError(null);
+      return undefined;
+    }
+
+    let url: string | null = null;
+    setTextPreview(null);
+    setError(null);
+
+    try {
+      const blob = dataUrlToBlob(dataUrl);
+      url = URL.createObjectURL(blob);
+      setObjectUrl(url);
+      if (isText) {
+        blob.text().then((value) => setTextPreview(value)).catch(() => setTextPreview(null));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to prepare file preview');
+    }
+
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [dataUrl, isText, open]);
+
+  const canPreview = Boolean(objectUrl && (isPdf || isImage || isText));
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-5xl" style={{ width: 'min(1100px, 100%)' }}>
+        <DialogHeader>
+          <div className="flex items-start justify-between gap-3">
+            <DialogTitle className="flex min-w-0 items-center gap-2">
+              <FileText className="h-5 w-5 shrink-0" />
+              <span className="truncate">{displayName}</span>
+            </DialogTitle>
+            <Button variant="ghost" size="icon" onClick={() => onOpenChange(false)} aria-label="Close file preview">
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        </DialogHeader>
+
+        {error && <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
+
+        {!error && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground">
+              <span>{type}</span>
+              {objectUrl && (
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" onClick={() => window.open(objectUrl, '_blank', 'noopener,noreferrer')}>
+                    <ExternalLink className="mr-2 h-4 w-4" />
+                    Open in new tab
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => downloadBlobUrl(objectUrl, displayName)}>
+                    <Download className="mr-2 h-4 w-4" />
+                    Download
+                  </Button>
+                </div>
+              )}
+            </div>
+
+            {canPreview && objectUrl && isPdf && (
+              <iframe title={displayName} src={objectUrl} className="h-[72vh] w-full rounded-md border bg-slate-50" />
+            )}
+
+            {canPreview && objectUrl && isImage && (
+              <div className="flex max-h-[72vh] items-center justify-center overflow-auto rounded-md border bg-slate-50 p-3">
+                <img src={objectUrl} alt={displayName} className="max-h-full max-w-full object-contain" />
+              </div>
+            )}
+
+            {canPreview && isText && (
+              <pre className="max-h-[72vh] overflow-auto rounded-md border bg-slate-50 p-3 text-xs">{textPreview || 'Loading preview...'}</pre>
+            )}
+
+            {!canPreview && (
+              <div className="rounded-md border bg-slate-50 p-6 text-center text-sm text-muted-foreground">
+                Preview is not available for this file type. You can open it in a new tab or download it.
+              </div>
+            )}
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function sourceRecordUrl(entry: DocVaultEntry) {
+  const metadata = entry.public_metadata || {};
+  if (typeof metadata.source_url === 'string' && metadata.source_url) {
+    return metadata.source_url;
+  }
+  if (!metadata.source_owner_id) {
+    return null;
+  }
+  const routes: Record<string, string> = {
+    statement: `/statements?id=${metadata.source_owner_id}`,
+    invoice: `/invoices/view/${metadata.source_owner_id}`,
+    expense: `/expenses/view/${metadata.source_owner_id}`,
+    inventory: `/inventory/view/${metadata.source_owner_id}`,
+    portfolio: `/investments/portfolio/${metadata.source_owner_id}`,
+  };
+  return routes[String(metadata.source_owner_type)] || null;
 }
 
 function isImmutable(entry: Pick<DocVaultEntry, 'public_metadata'>) {
@@ -742,6 +940,7 @@ export default function DocVault() {
   const [wizardStep, setWizardStep] = React.useState(1);
   const [scanDraft, setScanDraft] = React.useState<Record<string, any> | null>(null);
   const [unlocking, setUnlocking] = React.useState<DocVaultEntry | null>(null);
+  const [unlockIntent, setUnlockIntent] = React.useState<UnlockIntent>('details');
   const [unlocked, setUnlocked] = React.useState<DocVaultEntry | null>(null);
   const [mfaCode, setMfaCode] = React.useState('');
   const [unlockMethod, setUnlockMethod] = React.useState<UnlockMethod>(() => {
@@ -757,6 +956,7 @@ export default function DocVault() {
   const [replacingRecoveryCodes, setReplacingRecoveryCodes] = React.useState(false);
   const [mfaEnrollments, setMfaEnrollments] = React.useState<MfaEnrollment[]>([]);
   const [systemMfaStatus, setSystemMfaStatus] = React.useState<SystemMfaStatus | null>(null);
+  const [runtimeInfo, setRuntimeInfo] = React.useState<RuntimeInfo | null>(null);
   const [mfaSetup, setMfaSetup] = React.useState<MfaSetup | null>(null);
   const [mfaVerifyCode, setMfaVerifyCode] = React.useState('');
   const [selectedFile, setSelectedFile] = React.useState<{ name: string; type: string; size: number; dataUrl: string } | null>(null);
@@ -768,8 +968,14 @@ export default function DocVault() {
   const [signatures, setSignatures] = React.useState<SignatureRecord[]>([]);
   const [signatureForm, setSignatureForm] = React.useState({ signer_name: '', signer_email: '', provider: 'manual', signature_reference: '' });
   const [auditPackage, setAuditPackage] = React.useState<Record<string, any> | null>(null);
+  const [importDialogOpen, setImportDialogOpen] = React.useState(false);
+  const [importScan, setImportScan] = React.useState<ImportScanResponse | null>(null);
+  const [importBusy, setImportBusy] = React.useState(false);
   const [pendingDelete, setPendingDelete] = React.useState<DocVaultEntry | null>(null);
+  const [previewEntry, setPreviewEntry] = React.useState<DocVaultEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = React.useState(false);
+  const [saveBusy, setSaveBusy] = React.useState(false);
+  const saveInFlightRef = React.useRef(false);
   const titleInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const loadEntries = React.useCallback(async () => {
@@ -777,9 +983,22 @@ export default function DocVault() {
     setEntries(data);
   }, []);
 
+  const loadRuntimeInfo = React.useCallback(async () => {
+    const data = await apiRequest<RuntimeInfo>('/docvault/runtime');
+    setRuntimeInfo(data);
+  }, []);
+
   React.useEffect(() => {
     loadEntries().catch((error) => toast.error(error.message || 'Failed to load DocVault'));
-  }, [loadEntries]);
+    loadRuntimeInfo().catch(() => {
+      setRuntimeInfo({
+        mode: 'standalone',
+        plugin_mode: false,
+        standalone: true,
+        features: { import_existing: false },
+      });
+    });
+  }, [loadEntries, loadRuntimeInfo]);
 
   const filtered = entries.filter((entry) => {
     const text = `${entry.title} ${entry.file_name || ''} ${entry.owner_name || ''} ${entry.issuer || ''} ${entry.tags.join(' ')}`.toLowerCase();
@@ -829,6 +1048,7 @@ export default function DocVault() {
     .map((factorId) => systemMfaStatus?.supported_factors.find((factor) => factor.id === factorId)?.label || factorId)
     .join(', ');
   const formPasswordScore = passwordScore(form.password);
+  const canImportExisting = Boolean(runtimeInfo?.features.import_existing);
 
   React.useEffect(() => {
     setPage(1);
@@ -1012,6 +1232,41 @@ export default function DocVault() {
     toast.success('Audit package generated');
   }
 
+  async function scanExistingDocuments() {
+    setImportBusy(true);
+    try {
+      const data = await apiRequest<ImportScanResponse>('/docvault/import/scan', {
+        method: 'POST',
+        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense', 'inventory', 'portfolio'] }),
+      });
+      setImportScan(data);
+      toast.success(`Found ${data.summary.importable} document(s) to import`);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function runExistingDocumentImport() {
+    setImportBusy(true);
+    try {
+      const data = await apiRequest<ImportRunResponse>('/docvault/import/run', {
+        method: 'POST',
+        body: JSON.stringify({ components: ['bank_statement', 'invoice', 'expense', 'inventory', 'portfolio'], dry_run: false }),
+      });
+      setImportScan(data);
+      await loadEntries();
+      toast.success(`Imported ${data.summary.imported} document(s)`);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  function openImportDialog() {
+    if (!canImportExisting) return;
+    setImportDialogOpen(true);
+    scanExistingDocuments().catch((error) => toast.error(error.message || 'Import scan failed'));
+  }
+
   function applySystemMfaDefaults(status: SystemMfaStatus) {
     if (!status.available || !status.configured) return;
     setUnlockSettings((current) => {
@@ -1102,6 +1357,11 @@ export default function DocVault() {
   }
 
   async function saveEntry() {
+    if (saveInFlightRef.current) return;
+    saveInFlightRef.current = true;
+    setSaveBusy(true);
+
+    try {
     const metadata: Record<string, any> = {};
     const sensitive: Record<string, any> = {};
     const isEditing = Boolean(editingEntry);
@@ -1235,6 +1495,10 @@ export default function DocVault() {
     setWizardStep(1);
     await loadEntries();
     toast.success(isEditing ? 'DocVault item updated' : 'Saved to DocVault');
+    } finally {
+      saveInFlightRef.current = false;
+      setSaveBusy(false);
+    }
   }
 
   async function deleteEntry(entry: DocVaultEntry) {
@@ -1256,6 +1520,11 @@ export default function DocVault() {
     }
   }
 
+  function startUnlock(entry: DocVaultEntry, intent: UnlockIntent = 'details') {
+    setUnlockIntent(intent);
+    setUnlocking(entry);
+  }
+
   async function unlockEntry() {
     if (!unlocking) return;
     if (!unlockSettings.enabled[unlockMethod]) {
@@ -1266,8 +1535,13 @@ export default function DocVault() {
       method: 'POST',
       body: JSON.stringify({ factor_id: selectedUnlockMethod.factorId, user_input: mfaCode }),
     });
-    setUnlocked(data);
+    if (unlockIntent === 'file' && data.file_data_url) {
+      setPreviewEntry(data);
+    } else {
+      setUnlocked(data);
+    }
     setUnlocking(null);
+    setUnlockIntent('details');
     setMfaCode('');
   }
 
@@ -1383,6 +1657,8 @@ export default function DocVault() {
     setScanDraft(null);
     setWizardStep(1);
     setWizardOpen(true);
+    saveInFlightRef.current = false;
+    setSaveBusy(false);
     window.requestAnimationFrame(() => {
       titleInputRef.current?.focus();
     });
@@ -1428,12 +1704,15 @@ export default function DocVault() {
     setScanDraft(null);
     setWizardStep(2);
     setWizardOpen(true);
+    saveInFlightRef.current = false;
+    setSaveBusy(false);
     window.requestAnimationFrame(() => {
       titleInputRef.current?.focus();
     });
   }
 
   function closeWizard() {
+    if (saveInFlightRef.current) return;
     setWizardOpen(false);
     setWizardStep(1);
     setEditingEntry(null);
@@ -1454,7 +1733,7 @@ export default function DocVault() {
               <Archive className="h-4 w-4" />
               Secure records
             </div>
-            <h1 className="text-3xl font-bold tracking-tight text-slate-950">DocVault</h1>
+            <h1 className="text-3xl font-bold tracking-tight text-slate-950">YFW DocVault</h1>
             <p className="max-w-2xl text-sm text-muted-foreground">Manage credentials, IDs, certificates, and documents with expiry tracking and MFA-gated details.</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1470,6 +1749,12 @@ export default function DocVault() {
               <PackageCheck className="h-4 w-4" />
               Audit package
             </Button>
+            {canImportExisting && (
+              <Button variant="outline" onClick={openImportDialog}>
+                <RotateCcw className="h-4 w-4" />
+                Import existing
+              </Button>
+            )}
             <Button variant="outline" onClick={() => setSettingsOpen(true)}>
               <Settings className="h-4 w-4" />
               Settings
@@ -1563,8 +1848,9 @@ export default function DocVault() {
               {paginated.map((entry) => {
                 const entryConfig = tabConfig.find((tab) => tab.id === entry.category);
                 const EntryIcon = entryConfig?.icon || FileText;
+                const sourceUrl = sourceRecordUrl(entry);
                 return (
-                  <Card key={entry.id} className="overflow-hidden transition hover:border-blue-200 hover:shadow-md">
+                  <Card key={entry.id} id={`entry-${entry.id}`} className="overflow-hidden transition hover:border-blue-200 hover:shadow-md">
                     <CardContent className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
                       <div className="flex min-w-0 gap-3">
                         {entry.thumbnail_data_url ? (
@@ -1621,8 +1907,23 @@ export default function DocVault() {
                       <div className="flex flex-wrap gap-2 md:justify-end">
                         {entry.category === 'document' && (
                           <>
-                            {(entry.file_name || cloudIntegration(entry)) && (
-                              <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
+                            {(entry.file_name || cloudIntegration(entry) || sourceUrl) && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  if (sourceUrl) {
+                                    window.location.assign(sourceUrl);
+                                    return;
+                                  }
+                                  const cloudFileUrl = cloudIntegration(entry)?.file_url;
+                                  if (cloudFileUrl) {
+                                    window.open(cloudFileUrl, '_blank', 'noopener,noreferrer');
+                                    return;
+                                  }
+                                  startUnlock(entry, 'file');
+                                }}
+                              >
                                 <ExternalLink className="mr-2 h-4 w-4" />
                                 Open
                               </Button>
@@ -1633,7 +1934,7 @@ export default function DocVault() {
                             </Button>
                           </>
                         )}
-                        <Button variant="outline" size="sm" onClick={() => setUnlocking(entry)}>
+                        <Button variant="outline" size="sm" onClick={() => startUnlock(entry, 'details')}>
                           <Lock className="mr-2 h-4 w-4" />
                           Details
                         </Button>
@@ -1730,6 +2031,133 @@ export default function DocVault() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {canImportExisting && (
+        <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <RotateCcw className="h-5 w-5 text-blue-700" />
+                Import existing documents
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
+                Scan bank statement, invoice, expense, inventory, and portfolio attachments, then create DocVault document records for anything not already linked.
+              </div>
+              <div className="grid gap-3 sm:grid-cols-4">
+                <div className="rounded-lg border border-slate-200 bg-white p-3">
+                  <div className="text-xs font-semibold uppercase text-slate-500">Scanned</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.scanned ?? 0}</div>
+                </div>
+                <div className="rounded-lg border border-blue-200 bg-white p-3 text-blue-800">
+                  <div className="text-xs font-semibold uppercase">Ready</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.importable ?? 0}</div>
+                </div>
+                <div className="rounded-lg border border-emerald-200 bg-white p-3 text-emerald-800">
+                  <div className="text-xs font-semibold uppercase">Imported</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.imported ?? 0}</div>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-white p-3">
+                  <div className="text-xs font-semibold uppercase text-slate-500">Existing</div>
+                  <div className="mt-1 text-2xl font-bold">{importScan?.summary.already_imported ?? 0}</div>
+                </div>
+              </div>
+
+              <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
+                {(importScan?.candidates || []).length === 0 ? (
+                  <div className="p-4 text-sm text-muted-foreground">
+                    {importBusy ? 'Scanning documents...' : 'No importable documents found yet.'}
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-200">
+                    {(importScan?.candidates || []).slice(0, 25).map((candidate) => {
+                      const cloudUrl = candidate.storage_provider === 'cloud' && candidate.storage_key?.startsWith('http') ? candidate.storage_key : null;
+                      return (
+                        <div key={`${candidate.source_table}-${candidate.source_attachment_id}`} className="flex items-center justify-between gap-3 p-3 text-sm">
+                          <div className="min-w-0 flex-1">
+                            {cloudUrl ? (
+                              <a
+                                href={cloudUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-1 truncate font-medium text-blue-700 hover:underline"
+                              >
+                                <ExternalLink className="h-3 w-3 shrink-0" />
+                                <span className="truncate">{candidate.file_name}</span>
+                              </a>
+                            ) : (
+                              <div className="truncate font-medium text-slate-900">{candidate.file_name}</div>
+                            )}
+                            <div className="text-xs text-muted-foreground">
+                              {candidate.owner_type.replace(/_/g, ' ')} #{candidate.owner_id} · {candidate.source_table} · {fileSize(candidate.file_size)}
+                            </div>
+                          </div>
+                          {candidate.already_imported && candidate.existing_entry_id ? (
+                            <a
+                              href={`#entry-${candidate.existing_entry_id}`}
+                              onClick={() => setImportDialogOpen(false)}
+                              className="shrink-0 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                            >
+                              Linked ↗
+                            </a>
+                          ) : (
+                            <Badge variant="outline" className={candidate.already_imported ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-blue-200 bg-blue-50 text-blue-800'}>
+                              {candidate.already_imported ? 'Linked' : 'Ready'}
+                            </Badge>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {(importScan?.candidates.length || 0) > 25 && (
+                      <div className="p-3 text-xs text-muted-foreground">
+                        Showing 25 of {importScan?.candidates.length} candidates.
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+            {Boolean(importScan?.summary.errors.length) && (
+              <details className="rounded-lg border border-red-200 bg-red-50 text-sm text-red-800" open>
+                <summary className="cursor-pointer select-none px-3 py-2 font-semibold">
+                  {importScan?.summary.errors.length} import error(s) — click to expand
+                </summary>
+                <div className="max-h-48 overflow-auto divide-y divide-red-200 border-t border-red-200">
+                  {importScan?.summary.errors.map((err, idx) => (
+                    <div key={idx} className="px-3 py-2 space-y-0.5">
+                      <div className="flex items-center gap-2 font-mono text-xs text-red-700">
+                        <span className="font-semibold">{err.file_name ?? err.source_table ?? '—'}</span>
+                        {err.source_attachment_id != null && (
+                          <span className="text-red-500">#{err.source_attachment_id}</span>
+                        )}
+                      </div>
+                      <div className="font-mono text-xs break-all text-red-900">{err.error}</div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                variant="outline"
+                disabled={importBusy}
+                onClick={() => scanExistingDocuments().catch((error) => toast.error(error.message || 'Import scan failed'))}
+              >
+                {importBusy ? 'Scanning...' : 'Rescan'}
+              </Button>
+              <Button
+                disabled={importBusy || !importScan || importScan.summary.importable === 0}
+                onClick={() => runExistingDocumentImport().catch((error) => toast.error(error.message || 'Import failed'))}
+              >
+                {importBusy ? 'Importing...' : `Import ${importScan?.summary.importable ?? 0}`}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+        </Dialog>
+      )}
 
       <Dialog open={wizardOpen} onOpenChange={(open) => !open && closeWizard()}>
         <DialogContent className="max-w-3xl">
@@ -2098,16 +2526,20 @@ export default function DocVault() {
             )}
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4">
-              <Button variant="ghost" onClick={closeWizard}>Cancel</Button>
+              <Button variant="ghost" disabled={saveBusy} onClick={closeWizard}>Cancel</Button>
               <div className="flex gap-2">
-                <Button variant="outline" disabled={wizardStep === 1 || Boolean(editingEntry && wizardStep === 2)} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
+                <Button variant="outline" disabled={saveBusy || wizardStep === 1 || Boolean(editingEntry && wizardStep === 2)} onClick={() => setWizardStep((step) => Math.max(1, step - 1))}>
                   Back
                 </Button>
                 {wizardStep < 3 ? (
                   <Button onClick={() => setWizardStep((step) => Math.min(3, step + 1))}>Next</Button>
                 ) : (
-                  <Button onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}>
-                    {editingEntry ? 'Save Changes' : 'Save to Vault'}
+                  <Button
+                    disabled={saveBusy}
+                    aria-busy={saveBusy}
+                    onClick={() => saveEntry().catch((error) => toast.error(error.message || 'Save failed'))}
+                  >
+                    {saveBusy ? 'Saving...' : editingEntry ? 'Save Changes' : 'Save to Vault'}
                   </Button>
                 )}
               </div>
@@ -2443,10 +2875,21 @@ export default function DocVault() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={!!unlocking} onOpenChange={(open) => !open && setUnlocking(null)}>
+      <Dialog
+        open={!!unlocking}
+        onOpenChange={(open) => {
+          if (!open) {
+            setUnlocking(null);
+            setUnlockIntent('details');
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><Lock className="h-5 w-5" /> Unlock vault details</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              <Lock className="h-5 w-5" />
+              {unlockIntent === 'file' ? 'Unlock file preview' : 'Unlock vault details'}
+            </DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             {availableUnlockMethods.length === 0 ? (
@@ -2478,7 +2921,9 @@ export default function DocVault() {
                     placeholder={selectedUnlockMethod.placeholder}
                   />
                 </div>
-                <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>Unlock</Button>
+                <Button className="w-full" onClick={() => unlockEntry().catch((error) => toast.error(error.message || 'Unlock failed'))}>
+                  {unlockIntent === 'file' ? 'Unlock and preview file' : 'Unlock'}
+                </Button>
               </>
             )}
           </div>
@@ -2548,7 +2993,7 @@ export default function DocVault() {
                   Open cloud file
                 </Button>
               )}
-              {unlocked.file_data_url && <Button variant="outline" onClick={() => window.open(unlocked.file_data_url!, '_blank')}>Open file</Button>}
+              {unlocked.file_data_url && <Button variant="outline" onClick={() => setPreviewEntry(unlocked)}>Preview file</Button>}
               {unlocked.category !== 'secret' && (
                 <Button
                   variant="outline"
@@ -2566,6 +3011,14 @@ export default function DocVault() {
           )}
         </DialogContent>
       </Dialog>
+
+      <FilePreviewDialog
+        open={!!previewEntry}
+        onOpenChange={(open) => !open && setPreviewEntry(null)}
+        dataUrl={previewEntry?.file_data_url}
+        fileName={previewEntry?.file_name}
+        mimeType={previewEntry?.file_mime_type}
+      />
 
       <Dialog open={!!historyEntry} onOpenChange={(open) => !open && setHistoryEntry(null)}>
         <DialogContent className="max-w-2xl">

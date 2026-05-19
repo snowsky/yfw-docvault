@@ -7,7 +7,7 @@ back to local SQLAlchemy primitives and the standalone Postgres database.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 
 try:
     from core.models.models_per_tenant import Base
@@ -78,7 +78,7 @@ class DocVaultEntryHistory(Base):
     action = Column(String, nullable=False)
     changed_fields = Column(JSON, nullable=False, default=list)
     details = Column(JSON, nullable=True)
-    snapshot = Column(EncryptedJSON(), nullable=True)
+    snapshot = Column(JSON, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
@@ -123,3 +123,35 @@ class DocVaultShareToken(Base):
     expires_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     access_count = Column(Integer, default=0, nullable=False)
+
+
+class DocVaultDocumentLink(Base):
+    __tablename__ = "docvault_document_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entry_id = Column(Integer, ForeignKey("docvault_entries.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_type = Column(String, nullable=False, index=True)
+    owner_id = Column(Integer, nullable=False, index=True)
+    linked_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("entry_id", "owner_type", "owner_id", name="uq_docvault_link"),
+    )
+
+
+class DocVaultAttachmentLocator(Base):
+    __tablename__ = "docvault_attachment_locators"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entry_id = Column(Integer, ForeignKey("docvault_entries.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    storage_provider = Column(String, nullable=False, default="local")
+    storage_key = Column(EncryptedColumn(), nullable=False)
+    source_table = Column(String, nullable=True, index=True)
+    source_attachment_id = Column(Integer, nullable=True, index=True)
+    original_checksum = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("source_table", "source_attachment_id", name="uq_docvault_locator_source"),
+    )

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 DocVaultCategory = Literal["credit_card", "ssl_certificate", "id_card", "document", "secret"]
 DocVaultCloudProvider = Literal["google_drive", "onedrive"]
+VALID_OWNER_TYPES = {"invoice", "expense", "statement", "inventory", "portfolio", "docvault_entry"}
 
 
 class DocVaultEntryBase(BaseModel):
@@ -61,6 +62,23 @@ class DocVaultEntryResponse(DocVaultEntryBase):
     secret_health: dict[str, Any] | None = None
     attachment_versions_count: int = 0
     signatures_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class DocVaultDocumentLinkCreate(BaseModel):
+    owner_type: str = Field(min_length=1, max_length=60)
+    owner_id: int = Field(gt=0)
+
+
+class DocVaultDocumentLinkResponse(DocVaultDocumentLinkCreate):
+    id: int
+    entry_id: int
+    linked_by: int | None = None
+    created_at: datetime
+    entry_title: str | None = None
+    entry_category: str | None = None
+    file_name: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -219,3 +237,56 @@ class DocVaultAuditPackageResponse(BaseModel):
     generated_by: str | None = None
     entries: list[dict[str, Any]]
     manifest: dict[str, Any]
+
+
+DocVaultImportComponent = Literal["bank_statement", "invoice", "expense", "inventory", "portfolio"]
+
+
+class DocVaultImportScanRequest(BaseModel):
+    components: list[DocVaultImportComponent] = Field(default_factory=lambda: ["bank_statement", "invoice", "expense", "inventory", "portfolio"])
+    include_statement_files: bool = True
+    include_statement_attachments: bool = True
+    include_invoice_attachments: bool = True
+    include_expense_attachments: bool = True
+    include_inventory_attachments: bool = True
+    include_portfolio_files: bool = True
+    limit: int | None = Field(default=None, ge=1, le=10000)
+
+
+class DocVaultImportRunRequest(DocVaultImportScanRequest):
+    dry_run: bool = False
+
+
+class DocVaultImportCandidate(BaseModel):
+    component: str
+    owner_type: str
+    owner_id: int
+    source_table: str
+    source_attachment_id: int
+    file_name: str
+    file_mime_type: str | None = None
+    file_size: int | None = None
+    storage_provider: str
+    storage_key: str
+    checksum_sha256: str | None = None
+    already_imported: bool = False
+    existing_entry_id: int | None = None
+
+
+class DocVaultImportSummary(BaseModel):
+    scanned: int
+    importable: int
+    already_imported: int
+    imported: int = 0
+    skipped: int = 0
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DocVaultImportScanResponse(BaseModel):
+    summary: DocVaultImportSummary
+    candidates: list[DocVaultImportCandidate]
+
+
+class DocVaultImportRunResponse(DocVaultImportScanResponse):
+    dry_run: bool
+    created_entry_ids: list[int] = Field(default_factory=list)
