@@ -8,6 +8,7 @@ DocVault is a document and expiry manager for YourFinanceWORKS. It can run as a 
 - Expiry status badges for expired, expiring soon, and valid items
 - AI-assisted card scan confirmation flow
 - MFA-gated access to sensitive details in plugin mode
+- Model Context Protocol (MCP) server integration to allow AI agents to manage documents, track expiries, and verify signatures (see [MCP Setup & Configuration Guide](docs/mcp-setup.md))
 - Version-controlled document attachments with checksum history
 - Google Drive and OneDrive document links with provider-aware validation
 - Digital signature records for document approvals
